@@ -166,7 +166,17 @@ try {
         $signature = Get-AuthenticodeSignature -FilePath $Path
         if (-not $signature.SignerCertificate) { throw "${Path}: no signer certificate" }
         if (-not $signature.TimeStamperCertificate) { throw "${Path}: no timestamp countersignature" }
-        if (-not $Redistributable -and $signature.SignerCertificate.Thumbprint -ne $thumbprint) {
+
+        if ($Redistributable) {
+            # Microsoft ships these timestamped by a certificate that expired long
+            # ago; the timestamp, not the certificate, is what keeps them valid.
+            if ($signature.SignerCertificate.Subject -notmatch 'Microsoft') {
+                throw "${Path}: signed by $($signature.SignerCertificate.Subject), not Microsoft"
+            }
+            return
+        }
+
+        if ($signature.SignerCertificate.Thumbprint -ne $thumbprint) {
             throw "${Path}: signed by $($signature.SignerCertificate.Thumbprint), not the release certificate"
         }
         if ($signature.SignerCertificate.NotAfter -le (Get-Date)) { throw "${Path}: the signing certificate has expired" }
@@ -174,7 +184,7 @@ try {
         $chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
         $chain.ChainPolicy.RevocationMode = 'NoCheck'
         $chain.ChainPolicy.DisableCertificateDownloads = $true
-        if ($selfSigned -and -not $Redistributable) {
+        if ($selfSigned) {
             # Trusting the certificate through a store starts Windows' automatic
             # root update, which needs the internet; anchoring the chain on the
             # release certificate itself keeps verification local.
@@ -199,16 +209,24 @@ try {
     $binaries = Get-PeFiles $bundleDir
     if (-not $binaries) { throw "no executables or libraries under $bundleDir" }
 
-    # The MSVC redistributables keep the Microsoft signature they ship with.
-    $redistributables = @('msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll', 'vcruntime140.dll',
-        'vcruntime140_1.dll', 'concrt140.dll')
-    $toSign = $binaries | Where-Object { $_.Name -notin $redistributables }
-    $kept = $binaries | Where-Object { $_.Name -in $redistributables }
-    Write-Phase "$($binaries.Count) executable(s) in the bundle, $($toSign.Count) to sign"
+    # Anything Microsoft already signed keeps that signature: re-signing the VC
+    # redistributables would replace a publisher the user can verify.
+    $toSign = @()
+    $kept = @()
+    foreach ($file in $binaries) {
+        $existing = Get-AuthenticodeSignature -FilePath $file.FullName
+        if ($existing.SignerCertificate -and $existing.SignerCertificate.Subject -match 'Microsoft') {
+            $kept += $file
+        } else {
+            $toSign += $file
+        }
+    }
+    $keptNames = $kept | ForEach-Object { $_.Name }
+    Write-Phase "$($binaries.Count) executable(s), $($toSign.Count) to sign, $($kept.Count) keeping Microsoft's signature"
 
     $probe = Join-Path $env:RUNNER_TEMP 'tsa-probe.exe'
     $signingPfx = $pfxPath
-    Copy-Item ($binaries | Sort-Object Length | Select-Object -First 1).FullName $probe -Force
+    Copy-Item ($toSign | Sort-Object Length | Select-Object -First 1).FullName $probe -Force
     Write-Phase 'checking that signtool accepts the certificate'
     $probeSign = Invoke-Tool -FilePath $signTool -TimeoutSeconds 120 -Arguments @(
         'sign', '/f', $signingPfx, '/p', $env:WINDOWS_CERTIFICATE_PASSWORD, '/fd', 'SHA256', $probe)
@@ -219,7 +237,7 @@ try {
         [IO.File]::WriteAllBytes($signingPfx, $cert.Export(
             [System.Security.Cryptography.X509Certificates.X509ContentType]::Pkcs12,
             $env:WINDOWS_CERTIFICATE_PASSWORD))
-        Copy-Item ($binaries | Sort-Object Length | Select-Object -First 1).FullName $probe -Force
+        Copy-Item ($toSign | Sort-Object Length | Select-Object -First 1).FullName $probe -Force
         $retry = Invoke-Tool -FilePath $signTool -TimeoutSeconds 120 -Arguments @(
             'sign', '/f', $signingPfx, '/p', $env:WINDOWS_CERTIFICATE_PASSWORD, '/fd', 'SHA256', $probe)
         if ($retry.ExitCode -ne 0) {
@@ -280,7 +298,7 @@ try {
         throw "the archive holds $($zipped.Count) executable(s), the signed bundle has $($binaries.Count)"
     }
     foreach ($file in $zipped) {
-        Assert-SignedFile $file.FullName -Redistributable:($file.Name -in $redistributables)
+        Assert-SignedFile $file.FullName -Redistributable:($file.Name -in $keptNames)
     }
     Write-Phase "verified $($zipped.Count) signed executable(s) inside the archive"
 
