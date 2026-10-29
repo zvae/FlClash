@@ -86,7 +86,9 @@ function Invoke-Tool {
         [string[]]$Arguments,
         [int]$TimeoutSeconds = 180
     )
-    $safeArguments = $Arguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }
+    $safeArguments = $Arguments | ForEach-Object {
+        if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+    }
     $log = Join-Path $env:RUNNER_TEMP ("tool-" + [guid]::NewGuid().ToString('N') + '.log')
     $process = Start-Process -FilePath $FilePath -ArgumentList $safeArguments -NoNewWindow -PassThru `
         -RedirectStandardOutput $log -RedirectStandardError "$log.err"
@@ -119,12 +121,16 @@ function Select-TimestampUrl {
 }
 
 try {
-    Write-Phase 'importing the release certificate'
+    Write-Phase 'loading the release certificate'
     [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_PFX_BASE64))
-    $secure = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
-    $cert = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation 'Cert:\CurrentUser\My' -Password $secure
+    # EphemeralKeySet keeps the key off disk and out of the user profile, which is
+    # where a hostile or slow store could stall the run.
+    $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+        $pfxPath,
+        $env:WINDOWS_CERTIFICATE_PASSWORD,
+        [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet)
     $thumbprint = $cert.Thumbprint
-    if (-not $cert.HasPrivateKey) { throw 'the imported PFX holds no private key' }
+    if (-not $cert.HasPrivateKey) { throw 'the PFX holds no private key' }
     if ($env:WINDOWS_SIGNER_SUBJECT) {
         # Windows prints the subject in its own attribute order, so compare the common name.
         $expected = $env:WINDOWS_SIGNER_SUBJECT
@@ -139,7 +145,8 @@ try {
     function Invoke-SignFile {
         param([string]$Path)
         $result = Invoke-Tool -FilePath $signTool -TimeoutSeconds 180 -Arguments @(
-            'sign', '/sha1', $thumbprint, '/s', 'My', '/fd', 'SHA256', '/tr', $timestampUrl, '/td', 'SHA256', $Path)
+            'sign', '/f', $pfxPath, '/p', $env:WINDOWS_CERTIFICATE_PASSWORD, '/fd', 'SHA256',
+            '/tr', $timestampUrl, '/td', 'SHA256', $Path)
         if ($result.ExitCode -ne 0) {
             throw "signtool sign failed for $Path (exit $($result.ExitCode)): $($result.Output)"
         }
@@ -226,6 +233,7 @@ try {
     $iscc = @('C:\Program Files (x86)\Inno Setup 6\ISCC.exe', 'C:\Program Files\Inno Setup 6\ISCC.exe') |
         Where-Object { Test-Path $_ } | Select-Object -First 1
     if (-not $iscc) { throw 'ISCC.exe was not found; install Inno Setup 6 on the runner.' }
+    Write-Phase 'building the installer'
     & $iscc '/Qp' (Join-Path $env:GITHUB_WORKSPACE '.github/custom/installer.iss')
     if ($LASTEXITCODE -ne 0) { throw 'ISCC failed to build the installer' }
     if (-not (Test-Path $installerPath)) { throw "the installer was not written to $installerPath" }
@@ -274,9 +282,6 @@ try {
     $verification | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $distDir 'verification-windows.json') -Encoding utf8
 }
 finally {
-    if ($thumbprint) {
-        Remove-Item "Cert:\CurrentUser\My\$thumbprint" -Force -ErrorAction SilentlyContinue
-    }
     Remove-Item $pfxPath -Force -ErrorAction SilentlyContinue
     Remove-Item (Join-Path $env:RUNNER_TEMP 'tsa-probe.exe') -Force -ErrorAction SilentlyContinue
     Remove-Item (Join-Path $env:RUNNER_TEMP 'tsa-probe.exe.orig') -Force -ErrorAction SilentlyContinue
