@@ -150,7 +150,7 @@ try {
     function Invoke-SignFile {
         param([string]$Path)
         $result = Invoke-Tool -FilePath $signTool -TimeoutSeconds 120 -Arguments @(
-            'sign', '/f', $pfxPath, '/p', $env:WINDOWS_CERTIFICATE_PASSWORD, '/fd', 'SHA256', $Path)
+            'sign', '/f', $signingPfx, '/p', $env:WINDOWS_CERTIFICATE_PASSWORD, '/fd', 'SHA256', $Path)
         if ($result.ExitCode -ne 0) {
             throw "signtool sign failed for $Path (exit $($result.ExitCode)): $($result.Output)"
         }
@@ -207,12 +207,25 @@ try {
     Write-Phase "$($binaries.Count) executable(s) in the bundle, $($toSign.Count) to sign"
 
     $probe = Join-Path $env:RUNNER_TEMP 'tsa-probe.exe'
+    $signingPfx = $pfxPath
     Copy-Item ($binaries | Sort-Object Length | Select-Object -First 1).FullName $probe -Force
     Write-Phase 'checking that signtool accepts the certificate'
     $probeSign = Invoke-Tool -FilePath $signTool -TimeoutSeconds 120 -Arguments @(
-        'sign', '/f', $pfxPath, '/p', $env:WINDOWS_CERTIFICATE_PASSWORD, '/fd', 'SHA256', $probe)
+        'sign', '/f', $signingPfx, '/p', $env:WINDOWS_CERTIFICATE_PASSWORD, '/fd', 'SHA256', $probe)
     if ($probeSign.ExitCode -ne 0) {
-        throw "signtool cannot sign with this PFX (exit $($probeSign.ExitCode)): $($probeSign.Output)"
+        Write-Warning "signtool rejected the PFX (exit $($probeSign.ExitCode)): $($probeSign.Output)"
+        Write-Phase 're-exporting the key material and retrying'
+        $signingPfx = Join-Path $env:RUNNER_TEMP 'windows-signing-rebuilt.pfx'
+        [IO.File]::WriteAllBytes($signingPfx, $cert.Export(
+            [System.Security.Cryptography.X509Certificates.X509ContentType]::Pkcs12,
+            $env:WINDOWS_CERTIFICATE_PASSWORD))
+        Copy-Item ($binaries | Sort-Object Length | Select-Object -First 1).FullName $probe -Force
+        $retry = Invoke-Tool -FilePath $signTool -TimeoutSeconds 120 -Arguments @(
+            'sign', '/f', $signingPfx, '/p', $env:WINDOWS_CERTIFICATE_PASSWORD, '/fd', 'SHA256', $probe)
+        if ($retry.ExitCode -ne 0) {
+            throw "signtool cannot sign with this PFX (exit $($retry.ExitCode)): $($retry.Output)"
+        }
+        Write-Phase 'signed with the re-exported PFX'
     }
     Write-Phase 'certificate accepted, probing timestamp servers'
     $timestampUrl = Select-TimestampUrl -SignedProbe $probe
@@ -300,6 +313,7 @@ try {
 }
 finally {
     Remove-Item $pfxPath -Force -ErrorAction SilentlyContinue
+    Remove-Item (Join-Path $env:RUNNER_TEMP 'windows-signing-rebuilt.pfx') -Force -ErrorAction SilentlyContinue
     Remove-Item (Join-Path $env:RUNNER_TEMP 'tsa-probe.exe') -Force -ErrorAction SilentlyContinue
     Remove-Item (Join-Path $env:RUNNER_TEMP 'tsa-probe.exe.probe') -Force -ErrorAction SilentlyContinue
     Remove-Item (Join-Path $env:RUNNER_TEMP 'zipcheck') -Recurse -Force -ErrorAction SilentlyContinue
