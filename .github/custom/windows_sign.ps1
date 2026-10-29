@@ -67,10 +67,14 @@ $thumbprint = $null
 $pfxPath = Join-Path $env:RUNNER_TEMP 'windows-signing.pfx'
 $timestampUrl = $null
 $clock = [System.Diagnostics.Stopwatch]::StartNew()
+# DigiCert rejects /tr https on some signtool builds with "Invalid Timestamp URL",
+# so the documented http endpoints are tried first.
 $timestampCandidates = @(
     $env:TIMESTAMP_URL
-    'https://timestamp.digicert.com'
+    'http://timestamp.digicert.com'
     'http://timestamp.sectigo.com'
+    'http://timestamp.globalsign.com/tsa/r6advanced1'
+    'https://timestamp.digicert.com'
 ) | Where-Object { $_ } | Select-Object -Unique
 
 function Write-Phase {
@@ -106,11 +110,12 @@ function Invoke-Tool {
 }
 
 function Select-TimestampUrl {
-    param([string]$ProbePath)
+    param([string]$SignedProbe)
     foreach ($url in $timestampCandidates) {
-        Copy-Item "$ProbePath.orig" $ProbePath -Force
+        Copy-Item $SignedProbe "$SignedProbe.probe" -Force
         $result = Invoke-Tool -FilePath $signTool -TimeoutSeconds 90 -Arguments @(
-            'sign', '/sha1', $thumbprint, '/s', 'My', '/fd', 'SHA256', '/tr', $url, '/td', 'SHA256', $ProbePath)
+            'timestamp', '/tr', $url, '/td', 'SHA256', "$SignedProbe.probe")
+        Remove-Item "$SignedProbe.probe" -Force -ErrorAction SilentlyContinue
         if ($result.ExitCode -eq 0) {
             Write-Phase "timestamp server $url answered"
             return $url
@@ -144,11 +149,15 @@ try {
 
     function Invoke-SignFile {
         param([string]$Path)
-        $result = Invoke-Tool -FilePath $signTool -TimeoutSeconds 180 -Arguments @(
-            'sign', '/f', $pfxPath, '/p', $env:WINDOWS_CERTIFICATE_PASSWORD, '/fd', 'SHA256',
-            '/tr', $timestampUrl, '/td', 'SHA256', $Path)
+        $result = Invoke-Tool -FilePath $signTool -TimeoutSeconds 120 -Arguments @(
+            'sign', '/f', $pfxPath, '/p', $env:WINDOWS_CERTIFICATE_PASSWORD, '/fd', 'SHA256', $Path)
         if ($result.ExitCode -ne 0) {
             throw "signtool sign failed for $Path (exit $($result.ExitCode)): $($result.Output)"
+        }
+        $stamped = Invoke-Tool -FilePath $signTool -TimeoutSeconds 120 -Arguments @(
+            'timestamp', '/tr', $timestampUrl, '/td', 'SHA256', $Path)
+        if ($stamped.ExitCode -ne 0) {
+            throw "timestamping failed for $Path with $timestampUrl (exit $($stamped.ExitCode)): $($stamped.Output)"
         }
     }
 
@@ -198,12 +207,20 @@ try {
     Write-Phase "$($binaries.Count) executable(s) in the bundle, $($toSign.Count) to sign"
 
     $probe = Join-Path $env:RUNNER_TEMP 'tsa-probe.exe'
-    Copy-Item ($binaries | Sort-Object Length | Select-Object -First 1).FullName "$probe.orig" -Force
-    $timestampUrl = Select-TimestampUrl -ProbePath $probe
-    Remove-Item $probe, "$probe.orig" -Force -ErrorAction SilentlyContinue
+    Copy-Item ($binaries | Sort-Object Length | Select-Object -First 1).FullName $probe -Force
+    Write-Phase 'checking that signtool accepts the certificate'
+    $probeSign = Invoke-Tool -FilePath $signTool -TimeoutSeconds 120 -Arguments @(
+        'sign', '/f', $pfxPath, '/p', $env:WINDOWS_CERTIFICATE_PASSWORD, '/fd', 'SHA256', $probe)
+    if ($probeSign.ExitCode -ne 0) {
+        throw "signtool cannot sign with this PFX (exit $($probeSign.ExitCode)): $($probeSign.Output)"
+    }
+    Write-Phase 'certificate accepted, probing timestamp servers'
+    $timestampUrl = Select-TimestampUrl -SignedProbe $probe
+    Remove-Item $probe, "$probe.probe" -Force -ErrorAction SilentlyContinue
     if (-not $timestampUrl) {
         throw 'no timestamp server answered; refusing to publish signatures without a timestamp'
     }
+    Write-Phase "timestamping $($toSign.Count) file(s) with $timestampUrl"
 
     foreach ($file in $toSign) {
         Invoke-SignFile $file.FullName
@@ -284,6 +301,6 @@ try {
 finally {
     Remove-Item $pfxPath -Force -ErrorAction SilentlyContinue
     Remove-Item (Join-Path $env:RUNNER_TEMP 'tsa-probe.exe') -Force -ErrorAction SilentlyContinue
-    Remove-Item (Join-Path $env:RUNNER_TEMP 'tsa-probe.exe.orig') -Force -ErrorAction SilentlyContinue
+    Remove-Item (Join-Path $env:RUNNER_TEMP 'tsa-probe.exe.probe') -Force -ErrorAction SilentlyContinue
     Remove-Item (Join-Path $env:RUNNER_TEMP 'zipcheck') -Recurse -Force -ErrorAction SilentlyContinue
 }

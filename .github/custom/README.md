@@ -75,7 +75,7 @@ What the pipeline does with that material:
 | Platform | Behaviour |
 | --- | --- |
 | Android | `apksigner verify` must pass, the debug certificate is refused, and `ANDROID_CERT_SHA256` pins the expected fingerprint |
-| Windows | Every executable and library in the bundle is signed, then the ZIP, then the installer. The timestamp server is chosen by probing before anything is signed, every `signtool` call has a timeout, the chain is anchored on the release certificate instead of a certificate store (importing a root store entry makes Windows try to update its root list over the network), and signer, timestamp, validity and chain are re-checked per file |
+| Windows | Every executable and library in the bundle is signed, then the ZIP, then the installer. Signing and timestamping are separate `signtool` calls, so a timestamp server can never block a signature; the endpoint is chosen by probing before anything is signed, every `signtool` call has a timeout, the chain is anchored on the release certificate instead of a certificate store (importing a root store entry makes Windows try to update its root list over the network), and signer, timestamp, validity and chain are re-checked per file |
 | macOS | Every Mach-O is signed, the certificate is trusted for code signing on the runner only, Hardened Runtime plus `release.entitlements` are applied, the DMG is signed separately and verified |
 
 `signingMode: official` is still supported: it requires a Developer ID Application certificate, notarizes with
