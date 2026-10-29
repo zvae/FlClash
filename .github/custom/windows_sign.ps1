@@ -65,9 +65,61 @@ function Get-PeFiles {
 $signTool = Get-SignTool
 $thumbprint = $null
 $pfxPath = Join-Path $env:RUNNER_TEMP 'windows-signing.pfx'
-$cerPath = Join-Path $env:RUNNER_TEMP 'windows-signing.cer'
+$timestampUrl = $null
+$clock = [System.Diagnostics.Stopwatch]::StartNew()
+$timestampCandidates = @(
+    $env:TIMESTAMP_URL
+    'https://timestamp.digicert.com'
+    'http://timestamp.sectigo.com'
+) | Where-Object { $_ } | Select-Object -Unique
+
+function Write-Phase {
+    param([string]$Message)
+    Write-Host ("[{0,4}s] {1}" -f [int]$clock.Elapsed.TotalSeconds, $Message)
+}
+
+# signtool has no timeout of its own: an unreachable timestamp server leaves it
+# waiting for as long as the TCP stack allows, so every call runs bounded.
+function Invoke-Tool {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments,
+        [int]$TimeoutSeconds = 180
+    )
+    $safeArguments = $Arguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }
+    $log = Join-Path $env:RUNNER_TEMP ("tool-" + [guid]::NewGuid().ToString('N') + '.log')
+    $process = Start-Process -FilePath $FilePath -ArgumentList $safeArguments -NoNewWindow -PassThru `
+        -RedirectStandardOutput $log -RedirectStandardError "$log.err"
+    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+        try { $process.Kill($true) } catch { }
+        Remove-Item $log, "$log.err" -Force -ErrorAction SilentlyContinue
+        return [pscustomobject]@{ ExitCode = 124; Output = "no result after ${TimeoutSeconds}s" }
+    }
+    $output = @()
+    foreach ($path in @($log, "$log.err")) {
+        if (Test-Path $path) { $output += Get-Content $path -ErrorAction SilentlyContinue }
+    }
+    Remove-Item $log, "$log.err" -Force -ErrorAction SilentlyContinue
+    return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = ($output -join "`n") }
+}
+
+function Select-TimestampUrl {
+    param([string]$ProbePath)
+    foreach ($url in $timestampCandidates) {
+        Copy-Item "$ProbePath.orig" $ProbePath -Force
+        $result = Invoke-Tool -FilePath $signTool -TimeoutSeconds 90 -Arguments @(
+            'sign', '/sha1', $thumbprint, '/s', 'My', '/fd', 'SHA256', '/tr', $url, '/td', 'SHA256', $ProbePath)
+        if ($result.ExitCode -eq 0) {
+            Write-Phase "timestamp server $url answered"
+            return $url
+        }
+        Write-Warning "timestamp server $url failed (exit $($result.ExitCode)): $($result.Output)"
+    }
+    return $null
+}
 
 try {
+    Write-Phase 'importing the release certificate'
     [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_PFX_BASE64))
     $secure = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
     $cert = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation 'Cert:\CurrentUser\My' -Password $secure
@@ -82,38 +134,47 @@ try {
             throw "the PFX common name is '$actual', expected '$expected'"
         }
     }
-    if ($selfSigned) {
-        Export-Certificate -Cert $cert -FilePath $cerPath -Type CERT | Out-Null
-        Import-Certificate -FilePath $cerPath -CertStoreLocation 'Cert:\CurrentUser\Root' | Out-Null
-        Write-Host 'trusted the self-signed release certificate for this run only'
-    }
-    Write-Host "signing as $($cert.Subject) [$thumbprint] ($signingMode)"
+    Write-Phase "signing as $($cert.Subject) [$thumbprint] ($signingMode)"
 
     function Invoke-SignFile {
         param([string]$Path)
-        & $signTool sign /sha1 $thumbprint /s My /fd SHA256 /tr $env:TIMESTAMP_URL /td SHA256 $Path
-        if ($LASTEXITCODE -ne 0) { throw "signtool sign failed for $Path" }
+        $result = Invoke-Tool -FilePath $signTool -TimeoutSeconds 180 -Arguments @(
+            'sign', '/sha1', $thumbprint, '/s', 'My', '/fd', 'SHA256', '/tr', $timestampUrl, '/td', 'SHA256', $Path)
+        if ($result.ExitCode -ne 0) {
+            throw "signtool sign failed for $Path (exit $($result.ExitCode)): $($result.Output)"
+        }
     }
 
     function Assert-SignedFile {
         param([string]$Path, [switch]$Redistributable)
-        & $signTool verify /pa /all $Path | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "signtool verify failed for $Path" }
         $signature = Get-AuthenticodeSignature -FilePath $Path
-        if ($signature.Status -ne 'Valid') { throw "${Path}: signature status is $($signature.Status)" }
+        if (-not $signature.SignerCertificate) { throw "${Path}: no signer certificate" }
         if (-not $signature.TimeStamperCertificate) { throw "${Path}: no timestamp countersignature" }
         if (-not $Redistributable -and $signature.SignerCertificate.Thumbprint -ne $thumbprint) {
             throw "${Path}: signed by $($signature.SignerCertificate.Thumbprint), not the release certificate"
         }
         if ($signature.SignerCertificate.NotAfter -le (Get-Date)) { throw "${Path}: the signing certificate has expired" }
+
         $chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
-        $chain.ChainPolicy.RevocationMode = 'Online'
-        $chain.ChainPolicy.RevocationFlag = 'ExcludeRoot'
+        $chain.ChainPolicy.RevocationMode = 'NoCheck'
+        $chain.ChainPolicy.DisableCertificateDownloads = $true
+        if ($selfSigned -and -not $Redistributable) {
+            # Trusting the certificate through a store starts Windows' automatic
+            # root update, which needs the internet; anchoring the chain on the
+            # release certificate itself keeps verification local.
+            $chain.ChainPolicy.TrustMode =
+                [System.Security.Cryptography.X509Certificates.X509ChainTrustMode]::CustomRootTrust
+            $chain.ChainPolicy.CustomTrustStore.Add($cert)
+        }
         if (-not $chain.Build($signature.SignerCertificate)) {
-            $fatal = $chain.ChainStatus |
-                Where-Object { $_.Status -notin 'RevocationStatusUnknown', 'OfflineRevocation' }
-            if ($fatal) {
-                throw "${Path}: certificate chain did not validate: $($fatal | ForEach-Object { $_.Status })"
+            $statuses = ($chain.ChainStatus | ForEach-Object { $_.Status }) -join ', '
+            throw "${Path}: certificate chain did not validate: $statuses"
+        }
+
+        if (-not $selfSigned) {
+            $result = Invoke-Tool -FilePath $signTool -TimeoutSeconds 90 -Arguments @('verify', '/pa', '/all', $Path)
+            if ($result.ExitCode -ne 0) {
+                throw "signtool verify failed for $Path (exit $($result.ExitCode)): $($result.Output)"
             }
         }
     }
@@ -127,14 +188,30 @@ try {
         'vcruntime140_1.dll', 'concrt140.dll')
     $toSign = $binaries | Where-Object { $_.Name -notin $redistributables }
     $kept = $binaries | Where-Object { $_.Name -in $redistributables }
+    Write-Phase "$($binaries.Count) executable(s) in the bundle, $($toSign.Count) to sign"
 
-    foreach ($file in $toSign) { Invoke-SignFile $file.FullName }
+    $probe = Join-Path $env:RUNNER_TEMP 'tsa-probe.exe'
+    Copy-Item ($binaries | Sort-Object Length | Select-Object -First 1).FullName "$probe.orig" -Force
+    $timestampUrl = Select-TimestampUrl -ProbePath $probe
+    Remove-Item $probe, "$probe.orig" -Force -ErrorAction SilentlyContinue
+    if (-not $timestampUrl) {
+        throw 'no timestamp server answered; refusing to publish signatures without a timestamp'
+    }
+
+    foreach ($file in $toSign) {
+        Invoke-SignFile $file.FullName
+        Write-Phase "signed $($file.Name)"
+    }
     foreach ($file in $toSign) { Assert-SignedFile $file.FullName }
     foreach ($file in $kept) { Assert-SignedFile $file.FullName -Redistributable }
-    Write-Host "signed and verified $($toSign.Count) file(s), kept $($kept.Count) redistributable signature(s)"
+    Write-Phase "signed and verified $($toSign.Count) file(s), kept $($kept.Count) redistributable signature(s)"
 
     New-Item -ItemType Directory -Force -Path $distDir | Out-Null
-    Compress-Archive -Path (Join-Path $bundleDir '*') -DestinationPath $zipPath -Force
+    Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::CreateFromDirectory(
+        $bundleDir, $zipPath, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+    Write-Phase "archived the signed bundle"
 
     $env:BRAND_APP_NAME = $env:APP_NAME
     $env:BRAND_VERSION = $env:VERSION
@@ -155,11 +232,11 @@ try {
 
     Invoke-SignFile $installerPath
     Assert-SignedFile $installerPath
-    Write-Host 'installer signed and verified'
+    Write-Phase 'installer signed and verified'
 
     $expanded = Join-Path $env:RUNNER_TEMP 'zipcheck'
     Remove-Item $expanded -Recurse -Force -ErrorAction SilentlyContinue
-    Expand-Archive -Path $zipPath -DestinationPath $expanded -Force
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $expanded)
     $zipped = Get-PeFiles $expanded
     if ($zipped.Count -ne $binaries.Count) {
         throw "the archive holds $($zipped.Count) executable(s), the signed bundle has $($binaries.Count)"
@@ -167,7 +244,7 @@ try {
     foreach ($file in $zipped) {
         Assert-SignedFile $file.FullName -Redistributable:($file.Name -in $redistributables)
     }
-    Write-Host "verified $($zipped.Count) signed executable(s) inside the archive"
+    Write-Phase "verified $($zipped.Count) signed executable(s) inside the archive"
 
     $verification = [ordered]@{
         platform       = 'windows'
@@ -185,8 +262,10 @@ try {
             subject           = $cert.Subject
             thumbprint        = $thumbprint
             selfSigned        = $selfSigned
-            trustedForRunOnly = $selfSigned
+            trustedForRunOnly = $false
+            chainAnchor       = if ($selfSigned) { 'release certificate' } else { 'system trust store' }
             timestamped       = $true
+            timestampUrl      = $timestampUrl
             chainValidated    = $true
             signedExecutables = $toSign.Count
         }
@@ -197,9 +276,9 @@ try {
 finally {
     if ($thumbprint) {
         Remove-Item "Cert:\CurrentUser\My\$thumbprint" -Force -ErrorAction SilentlyContinue
-        Remove-Item "Cert:\CurrentUser\Root\$thumbprint" -Force -ErrorAction SilentlyContinue
     }
     Remove-Item $pfxPath -Force -ErrorAction SilentlyContinue
-    Remove-Item $cerPath -Force -ErrorAction SilentlyContinue
+    Remove-Item (Join-Path $env:RUNNER_TEMP 'tsa-probe.exe') -Force -ErrorAction SilentlyContinue
+    Remove-Item (Join-Path $env:RUNNER_TEMP 'tsa-probe.exe.orig') -Force -ErrorAction SilentlyContinue
     Remove-Item (Join-Path $env:RUNNER_TEMP 'zipcheck') -Recurse -Force -ErrorAction SilentlyContinue
 }

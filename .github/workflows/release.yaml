@@ -26,7 +26,7 @@ env:
   FLUTTER_VERSION: '3.47.6'
   GO_VERSION: '1.27.1'
   NDK_VERSION: r28c
-  TIMESTAMP_URL: http://timestamp.digicert.com
+  TIMESTAMP_URL: https://timestamp.digicert.com
 
 jobs:
   prepare:
@@ -371,6 +371,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'flutter build windows failed' }
 
       - name: Sign, package and verify
+        timeout-minutes: 45
         env:
           APP_NAME: ${{ needs.prepare.outputs.app_name }}
           VERSION: ${{ needs.prepare.outputs.version }}
