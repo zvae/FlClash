@@ -100,12 +100,12 @@ try {
         & $signTool verify /pa /all $Path | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "signtool verify failed for $Path" }
         $signature = Get-AuthenticodeSignature -FilePath $Path
-        if ($signature.Status -ne 'Valid') { throw "$Path: signature status is $($signature.Status)" }
-        if (-not $signature.TimeStamperCertificate) { throw "$Path: no timestamp countersignature" }
+        if ($signature.Status -ne 'Valid') { throw "${Path}: signature status is $($signature.Status)" }
+        if (-not $signature.TimeStamperCertificate) { throw "${Path}: no timestamp countersignature" }
         if (-not $Redistributable -and $signature.SignerCertificate.Thumbprint -ne $thumbprint) {
-            throw "$Path: signed by $($signature.SignerCertificate.Thumbprint), not the release certificate"
+            throw "${Path}: signed by $($signature.SignerCertificate.Thumbprint), not the release certificate"
         }
-        if ($signature.SignerCertificate.NotAfter -le (Get-Date)) { throw "$Path: the signing certificate has expired" }
+        if ($signature.SignerCertificate.NotAfter -le (Get-Date)) { throw "${Path}: the signing certificate has expired" }
         $chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
         $chain.ChainPolicy.RevocationMode = 'Online'
         $chain.ChainPolicy.RevocationFlag = 'ExcludeRoot'
@@ -113,7 +113,7 @@ try {
             $fatal = $chain.ChainStatus |
                 Where-Object { $_.Status -notin 'RevocationStatusUnknown', 'OfflineRevocation' }
             if ($fatal) {
-                throw "$Path: certificate chain did not validate: $($fatal | ForEach-Object { $_.Status })"
+                throw "${Path}: certificate chain did not validate: $($fatal | ForEach-Object { $_.Status })"
             }
         }
     }

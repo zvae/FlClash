@@ -18,6 +18,10 @@ Everything the release pipeline needs lives in this directory, so none of it mix
 `.github/workflows/release.yaml` runs the pipeline: daily at 03:17 UTC, or by hand with an optional upstream tag and a
 dry-run switch.
 
+The workflow must live on the repository's default branch: GitHub only schedules workflows from the default branch and
+only lists those in the manual dispatch menu. Every run also reads this directory from the default branch, so the
+branding and signing scripts that shape a release are exactly the ones merged there.
+
 ## Tag policy
 
 The release tag is the upstream tag, byte for byte. Nothing is prefixed, suffixed, or rebuilt from a version number.
