@@ -79,3 +79,15 @@ devtools_options.yaml
 .fvm/
 .fvmrc
 /coverage/lcov.info
+
+# Branding and release tooling
+/.github/custom/signing/
+/.github/custom/.branding/
+__pycache__/
+/android/app/keystore.jks
+*.pfx
+*.p12
+*.key
+*.mobileprovision
+.workbuddy
+.zcode

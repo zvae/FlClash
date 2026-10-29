@@ -1,0 +1,667 @@
+name: release
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag to release; leave empty for the latest upstream release'
+        type: string
+        required: false
+      dry_run:
+        description: 'Build and verify without publishing'
+        type: boolean
+        default: false
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPOSITORY: chen08209/FlClash
+  FLUTTER_VERSION: '3.47.6'
+  GO_VERSION: '1.27.1'
+  NDK_VERSION: r28c
+  TIMESTAMP_URL: http://timestamp.digicert.com
+
+jobs:
+  prepare:
+    name: Prepare release ref
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.prepare.outputs.tag }}
+      upstream_sha: ${{ steps.prepare.outputs.upstream_sha }}
+      mirror_ref: ${{ steps.prepare.outputs.mirror_ref }}
+      mirror_sha: ${{ steps.prepare.outputs.mirror_sha }}
+      version: ${{ steps.prepare.outputs.version }}
+      app_name: ${{ steps.prepare.outputs.app_name }}
+      application_id: ${{ steps.prepare.outputs.application_id }}
+      windows_product_name: ${{ steps.prepare.outputs.windows_product_name }}
+      windows_company_name: ${{ steps.prepare.outputs.windows_company_name }}
+      publisher_url: ${{ steps.prepare.outputs.publisher_url }}
+      signing_mode: ${{ steps.prepare.outputs.signing_mode }}
+      should_release: ${{ steps.prepare.outputs.should_release }}
+      dry_run: ${{ steps.prepare.outputs.dry_run }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install icon tooling
+        run: python3 -m pip install --disable-pip-version-check --quiet pillow
+
+      - name: Prepare release ref
+        id: prepare
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          emit() { echo "$1=$2" >> "$GITHUB_OUTPUT"; }
+
+          emit dry_run "${INPUT_DRY_RUN:-false}"
+
+          tag="${INPUT_TAG:-}"
+          if [[ -z "$tag" ]]; then
+            latest=$(gh api "repos/$UPSTREAM_REPOSITORY/releases/latest")
+            if [[ "$(jq -r '.draft' <<<"$latest")" != 'false' || "$(jq -r '.prerelease' <<<"$latest")" != 'false' ]]; then
+              echo '::error::the upstream latest release is a draft or a pre-release'
+              exit 1
+            fi
+            tag=$(jq -r '.tag_name' <<<"$latest")
+          fi
+          [[ -n "$tag" ]] || { echo '::error::no upstream tag to release'; exit 1; }
+
+          ref=$(gh api "repos/$UPSTREAM_REPOSITORY/git/ref/tags/$tag")
+          upstream_sha=$(jq -r '.object.sha' <<<"$ref")
+          if [[ "$(jq -r '.object.type' <<<"$ref")" == 'tag' ]]; then
+            upstream_sha=$(gh api "repos/$UPSTREAM_REPOSITORY/git/tags/$(jq -r '.object.sha' <<<"$ref")" --jq '.object.sha')
+          fi
+          emit tag "$tag"
+          emit upstream_sha "$upstream_sha"
+          echo "upstream $tag -> $upstream_sha"
+
+          if release=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" 2>/dev/null); then
+            recorded=$(jq -r '.body // ""' <<<"$release" |
+              sed -n 's/^<!-- upstream-commit: \(.*\) -->$/\1/p' | head -1)
+            if [[ -n "$recorded" && "$recorded" != "$upstream_sha" ]]; then
+              echo "::error::upstream commit for $tag moved from $recorded to $upstream_sha"
+              exit 1
+            fi
+            echo "release $tag already exists; nothing to publish"
+            emit should_release false
+            exit 0
+          fi
+
+          if our_tag=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" 2>/dev/null); then
+            tag_sha=$(jq -r '.object.sha' <<<"$our_tag")
+            if [[ "$(jq -r '.object.type' <<<"$our_tag")" == 'tag' ]]; then
+              tag_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$(jq -r '.object.sha' <<<"$our_tag")" --jq '.object.sha')
+            fi
+            message=$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag_sha" --jq '.commit.message')
+            recorded=$(sed -n 's/^Upstream-Commit: \(.*\)$/\1/p' <<<"$message" | head -1)
+            if [[ -n "$recorded" ]]; then
+              if [[ "$recorded" != "$upstream_sha" ]]; then
+                echo "::error::tag $tag was built from upstream $recorded, upstream now reports $upstream_sha"
+                exit 1
+              fi
+            elif [[ "$tag_sha" != "$upstream_sha" ]]; then
+              echo "::error::tag $tag already exists at $tag_sha, which is not upstream $upstream_sha"
+              exit 1
+            fi
+            git fetch --no-tags origin "+refs/tags/$tag:refs/tags/$tag" || git fetch --no-tags origin "$tag_sha"
+            git checkout --detach "$tag_sha"
+            echo "tag $tag exists without a release; building from $tag_sha"
+            emit should_release true
+            emit mirror_ref "refs/tags/$tag"
+            emit mirror_sha "$tag_sha"
+          else
+            # The upstream tree carries none of this pipeline's scripts, so they ride
+            # along into the release commit and the tag stays self-contained.
+            overlay=(.github/custom)
+            tar -cf "$RUNNER_TEMP/overlay.tar" \
+              --exclude='.github/custom/signing' \
+              --exclude='.github/custom/.branding' \
+              --exclude='__pycache__' \
+              "${overlay[@]}"
+            git config user.name 'FlClash Release Bot'
+            git config user.email 'release-bot@users.noreply.github.com'
+            git fetch --no-tags "https://github.com/$UPSTREAM_REPOSITORY.git" \
+              "+refs/tags/$tag:refs/tags/upstream/$tag"
+            git checkout -B "release-mirror/$tag" "refs/tags/upstream/$tag"
+            tar -xf "$RUNNER_TEMP/overlay.tar" -C .
+            python3 .github/custom/apply.py --platform all --state-out "$RUNNER_TEMP/brand.json"
+            git add -A
+            # An unchecked-out submodule has no directory, and `git add -A` records
+            # that as a deletion; put the gitlink back before committing.
+            submodule_sha=$(git rev-parse "refs/tags/upstream/$tag:core/Clash.Meta")
+            git update-index --add --cacheinfo 160000 "$submodule_sha" core/Clash.Meta
+            git commit --quiet -m "chore(release): build $tag" \
+              -m "Upstream-Repository: $UPSTREAM_REPOSITORY" \
+              -m "Upstream-Tag: $tag" \
+              -m "Upstream-Commit: $upstream_sha"
+            mirror_sha=$(git rev-parse HEAD)
+            submodule_mode=$(git ls-tree HEAD -- core/Clash.Meta | awk '{print $1}')
+            if [[ "$submodule_mode" != '160000' ]]; then
+              echo '::error::the release commit lost the Go core submodule'
+              exit 1
+            fi
+            git push --force origin "HEAD:refs/heads/release-mirror/$tag"
+            echo "branded release commit $mirror_sha"
+            emit should_release true
+            emit mirror_ref "release-mirror/$tag"
+            emit mirror_sha "$mirror_sha"
+          fi
+
+          if [[ ! -f .github/custom/brand.json ]]; then
+            echo "::error::$tag holds no .github/custom/brand.json; it was not built by this pipeline"
+            exit 1
+          fi
+          brand=.github/custom/brand.json
+          version=$(sed -n 's/^version: *\([^+ ]*\).*/\1/p' pubspec.yaml | head -1)
+          if [[ "$version" != "${tag#v}" ]]; then
+            echo "::error::pubspec version $version does not match tag $tag"
+            exit 1
+          fi
+          emit version "$version"
+          emit app_name "$(jq -r '.appName' "$brand")"
+          emit application_id "$(jq -r '.androidApplicationId' "$brand")"
+          emit windows_product_name "$(jq -r '.windowsProductName' "$brand")"
+          emit windows_company_name "$(jq -r '.windowsCompanyName' "$brand")"
+          emit publisher_url "$(jq -r '.windowsPublisherUrl' "$brand")"
+          emit signing_mode "$(jq -r '.signingMode' "$brand")"
+          echo "releasing $(jq -r '.appName' "$brand") $version as $tag ($(jq -r '.signingMode' "$brand"))"
+
+  credentials:
+    name: Signing credentials
+    needs: [prepare]
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check required secrets
+        env:
+          SIGNING_MODE: ${{ needs.prepare.outputs.signing_mode }}
+          KEYSTORE: ${{ secrets.KEYSTORE }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in KEYSTORE KEY_ALIAS STORE_PASSWORD KEY_PASSWORD \
+            WINDOWS_CERTIFICATE_PFX_BASE64 WINDOWS_CERTIFICATE_PASSWORD \
+            MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD MACOS_KEYCHAIN_PASSWORD; do
+            [[ -n "${!name:-}" ]] || missing+=("$name")
+          done
+          if [[ "${SIGNING_MODE:-self-signed}" == 'official' ]]; then
+            [[ -n "${APPLE_TEAM_ID:-}" ]] || missing+=("APPLE_TEAM_ID")
+            if [[ -z "${APPLE_ID:-}" || -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]]; then
+              if [[ -z "${APPLE_API_KEY_P8_BASE64:-}" || -z "${APPLE_API_KEY_ID:-}" || -z "${APPLE_API_ISSUER_ID:-}" ]]; then
+                missing+=("APPLE_ID and APPLE_APP_SPECIFIC_PASSWORD, or APPLE_API_KEY_P8_BASE64 and APPLE_API_KEY_ID and APPLE_API_ISSUER_ID")
+              fi
+            fi
+          fi
+          if (( ${#missing[@]} > 0 )); then
+            printf '::error::signing credentials are missing: %s\n' "${missing[*]}"
+            echo 'See .github/custom/README.md for how to obtain each value and where it goes.'
+            exit 1
+          fi
+          echo "all signing credentials are configured for ${SIGNING_MODE:-self-signed} signing"
+
+  android:
+    name: Android
+    needs: [prepare, credentials]
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ needs.prepare.outputs.mirror_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          submodules: recursive
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: core/go.sum
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+          link-to-sdk: true
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Restore release keystore
+        env:
+          KEYSTORE: ${{ secrets.KEYSTORE }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$KEYSTORE" | base64 --decode > android/app/keystore.jks
+          {
+            echo "keyAlias=$KEY_ALIAS"
+            echo "storePassword=$STORE_PASSWORD"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > android/local.properties
+          test -s android/app/keystore.jks
+
+      - name: Build
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          echo '{"APP_ENV":"stable"}' > env.json
+          flutter pub get
+          flutter build apk --release --split-per-abi --dart-define-from-file=env.json
+
+      - name: Verify and collect
+        env:
+          APP_NAME: ${{ needs.prepare.outputs.app_name }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.mirror_sha }}
+          UPSTREAM_COMMIT: ${{ needs.prepare.outputs.upstream_sha }}
+          APPLICATION_ID: ${{ needs.prepare.outputs.application_id }}
+          DIST_DIR: dist
+          ANDROID_CERT_SHA256: ${{ secrets.ANDROID_CERT_SHA256 }}
+        run: bash .github/custom/android_verify.sh
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-android
+          path: dist
+          overwrite: true
+
+  windows:
+    name: Windows
+    needs: [prepare, credentials]
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ needs.prepare.outputs.mirror_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          submodules: recursive
+
+      - name: Enable git long paths
+        run: git config --global core.longpaths true
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: core/go.sum
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-windows
+          workspaces: |
+            services/helper
+            plugins/rust_api/rust
+          cache-directories: .dart_tool/hooks_runner
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Install Inno Setup
+        run: |
+          if (-not (Test-Path 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe')) {
+            choco install innosetup --no-progress -y
+          }
+
+      - name: Build
+        run: |
+          Set-Content -Path env.json -Value '{"APP_ENV":"stable"}' -NoNewline -Encoding utf8
+          flutter pub get
+          if ($LASTEXITCODE -ne 0) { throw 'flutter pub get failed' }
+          flutter build windows --release --dart-define-from-file=env.json
+          if ($LASTEXITCODE -ne 0) { throw 'flutter build windows failed' }
+
+      - name: Sign, package and verify
+        env:
+          APP_NAME: ${{ needs.prepare.outputs.app_name }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.mirror_sha }}
+          UPSTREAM_COMMIT: ${{ needs.prepare.outputs.upstream_sha }}
+          DIST_DIR: ${{ github.workspace }}\dist
+          SIGNING_MODE: ${{ needs.prepare.outputs.signing_mode }}
+          WINDOWS_PRODUCT_NAME: ${{ needs.prepare.outputs.windows_product_name }}
+          WINDOWS_COMPANY_NAME: ${{ needs.prepare.outputs.windows_company_name }}
+          WINDOWS_PUBLISHER_URL: ${{ needs.prepare.outputs.publisher_url }}
+          WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_SIGNER_SUBJECT: ${{ secrets.WINDOWS_SIGNER_SUBJECT }}
+        run: pwsh -NoProfile -File .github/custom/windows_sign.ps1
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows
+          path: dist
+          overwrite: true
+
+  macos:
+    name: macOS ${{ matrix.arch }}
+    needs: [prepare, credentials]
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            os: macos-latest
+          - arch: amd64
+            os: macos-15-intel
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ needs.prepare.outputs.mirror_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          submodules: recursive
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: core/go.sum
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-macos-${{ matrix.arch }}
+          workspaces: |
+            services/helper
+            plugins/rust_api/rust
+          cache-directories: .dart_tool/hooks_runner
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Setup Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.3.app || sudo xcode-select -s /Applications/Xcode_26.2.app
+          xcodebuild -version
+
+      - name: Disable Impeller on Intel macOS
+        if: matrix.arch == 'amd64'
+        run: plutil -replace FLTEnableImpeller -bool NO macos/Runner/Info.plist
+
+      - name: Build
+        env:
+          APP_NAME: ${{ needs.prepare.outputs.app_name }}
+        run: |
+          set -euo pipefail
+          printf '{"APP_ENV":"stable"}' > env.json
+          flutter pub get
+          flutter build macos --release --dart-define-from-file=env.json
+          test -d "build/macos/Build/Products/Release/$APP_NAME.app"
+
+      - name: Create keychain
+        env:
+          SIGNING_MODE: ${{ needs.prepare.outputs.signing_mode }}
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APP_NAME: ${{ needs.prepare.outputs.app_name }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.mirror_sha }}
+          UPSTREAM_COMMIT: ${{ needs.prepare.outputs.upstream_sha }}
+          MACOS_ARCH: ${{ matrix.arch }}
+          DIST_DIR: dist
+        run: bash .github/custom/macos_sign.sh keychain
+
+      - name: Sign
+        env:
+          SIGNING_MODE: ${{ needs.prepare.outputs.signing_mode }}
+          APP_NAME: ${{ needs.prepare.outputs.app_name }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.mirror_sha }}
+          UPSTREAM_COMMIT: ${{ needs.prepare.outputs.upstream_sha }}
+          MACOS_ARCH: ${{ matrix.arch }}
+          DIST_DIR: dist
+        run: bash .github/custom/macos_sign.sh sign
+
+      - name: Package
+        env:
+          SIGNING_MODE: ${{ needs.prepare.outputs.signing_mode }}
+          APP_NAME: ${{ needs.prepare.outputs.app_name }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.mirror_sha }}
+          UPSTREAM_COMMIT: ${{ needs.prepare.outputs.upstream_sha }}
+          MACOS_ARCH: ${{ matrix.arch }}
+          DIST_DIR: dist
+        run: bash .github/custom/macos_sign.sh package
+
+      - name: Finalize
+        env:
+          SIGNING_MODE: ${{ needs.prepare.outputs.signing_mode }}
+          APP_NAME: ${{ needs.prepare.outputs.app_name }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.mirror_sha }}
+          UPSTREAM_COMMIT: ${{ needs.prepare.outputs.upstream_sha }}
+          MACOS_ARCH: ${{ matrix.arch }}
+          DIST_DIR: dist
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: bash .github/custom/macos_sign.sh finalize
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos-${{ matrix.arch }}
+          path: dist
+          overwrite: true
+
+      - name: Cleanup credentials
+        if: always()
+        run: bash .github/custom/macos_sign.sh cleanup
+
+  release:
+    name: Publish
+    needs: [prepare, credentials, android, windows, macos]
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Gate
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          APP_NAME: ${{ needs.prepare.outputs.app_name }}
+          UPSTREAM_COMMIT: ${{ needs.prepare.outputs.upstream_sha }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.mirror_sha }}
+          SIGNING_MODE: ${{ needs.prepare.outputs.signing_mode }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 .github/custom/manifest.py \
+            --dist dist \
+            --tag "$TAG" \
+            --version "$VERSION" \
+            --app-name "$APP_NAME" \
+            --upstream-repository "$UPSTREAM_REPOSITORY" \
+            --upstream-commit "$UPSTREAM_COMMIT" \
+            --source-commit "$SOURCE_COMMIT" \
+            --signing-mode "$SIGNING_MODE" \
+            --run-url "$RUN_URL"
+          (cd dist && sha256sum -c SHA256SUMS)
+          mv dist/release.md release-body.md
+
+      - name: Confirm upstream tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          UPSTREAM_COMMIT: ${{ needs.prepare.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          latest=$(gh api "repos/$UPSTREAM_REPOSITORY/git/ref/tags/$TAG")
+          actual=$(jq -r '.object.sha' <<<"$latest")
+          if [[ "$(jq -r '.object.type' <<<"$latest")" == 'tag' ]]; then
+            actual=$(gh api "repos/$UPSTREAM_REPOSITORY/git/tags/$(jq -r '.object.sha' <<<"$latest")" --jq '.object.sha')
+          fi
+          if [[ "$actual" != "$UPSTREAM_COMMIT" ]]; then
+            echo "::error::upstream $TAG now points at $actual, this run built $UPSTREAM_COMMIT"
+            exit 1
+          fi
+          echo "upstream $TAG still points at $UPSTREAM_COMMIT"
+
+      - name: Create tag
+        if: needs.prepare.outputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          MIRROR_SHA: ${{ needs.prepare.outputs.mirror_sha }}
+        run: |
+          set -euo pipefail
+          if existing=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" 2>/dev/null); then
+            current=$(jq -r '.object.sha' <<<"$existing")
+            if [[ "$current" != "$MIRROR_SHA" ]]; then
+              echo "::error::tag $TAG already points at $current; refusing to move it"
+              exit 1
+            fi
+            echo "tag $TAG already points at $MIRROR_SHA"
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$TAG" -f sha="$MIRROR_SHA" > /dev/null
+            echo "created tag $TAG at $MIRROR_SHA"
+          fi
+
+      - name: Create release
+        if: needs.prepare.outputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > /dev/null 2>&1; then
+            echo "::error::release $TAG already exists; refusing to replace its assets"
+            exit 1
+          fi
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --notes-file release-body.md \
+            --verify-tag
+          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY"
+
+      - name: Verify release
+        if: needs.prepare.outputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > "$RUNNER_TEMP/release.json"
+          published=$(jq -r '.tag_name' "$RUNNER_TEMP/release.json")
+          if [[ "$published" != "$TAG" ]]; then
+            echo "::error::the published tag is '$published', expected '$TAG'"
+            exit 1
+          fi
+          cd dist
+          for file in *; do
+            size=$(stat --printf='%s' "$file")
+            remote=$(jq -r --arg name "$file" \
+              '.assets[] | select(.name == $name) | "\(.size) \(.digest // "")"' "$RUNNER_TEMP/release.json")
+            if [[ -z "$remote" ]]; then
+              echo "::error::$file is not attached to the release"
+              exit 1
+            fi
+            if [[ "${remote%% *}" != "$size" ]]; then
+              echo "::error::$file is ${remote%% *} bytes on the release, $size locally"
+              exit 1
+            fi
+            digest="${remote#* }"
+            if [[ -n "$digest" && "$digest" != "sha256:$(sha256sum "$file" | cut -d' ' -f1)" ]]; then
+              echo "::error::$file digest on the release does not match the local file"
+              exit 1
+            fi
+          done
+          echo "release $TAG verified with $(jq '.assets | length' "$RUNNER_TEMP/release.json") assets"
+
+      - name: Dry run summary
+        if: needs.prepare.outputs.dry_run == 'true'
+        run: |
+          echo "::notice::dry run: ${{ needs.prepare.outputs.tag }} was built and gated but not published"
+          ls -l dist

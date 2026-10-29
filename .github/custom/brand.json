@@ -1,0 +1,10 @@
+{
+  "appName": "FlFly",
+  "androidApplicationId": "com.flfly.clash",
+  "macosBundleId": "com.flfly.clash",
+  "windowsProductName": "FlFly",
+  "windowsCompanyName": "com.flfly",
+  "windowsPublisherUrl": "https://github.com/zvae/FlClash",
+  "replaceIcon": false,
+  "signingMode": "self-signed"
+}

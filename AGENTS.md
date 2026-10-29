@@ -19,6 +19,8 @@ Read these only when the task touches their area:
   profile, or asks for an Android VPN restart.
 - [.agents/surfaces.md](.agents/surfaces.md): fill levels, selection and status colors, and the few borders that
   remain, for any change to how a surface is colored.
+- [.github/custom/README.md](.github/custom/README.md): the signed release pipeline, its tag policy, brand
+  configuration, signing material, and the GitHub secrets it needs.
 - [.agents/agent-config.md](.agents/agent-config.md): how to choose between `AGENTS.md`, `.agents`, skills, Codex config,
   command rules, and hooks.
 - [.agents/worktrees.md](.agents/worktrees.md): worktree hygiene across Claude Code, Codex, and Gemini.
