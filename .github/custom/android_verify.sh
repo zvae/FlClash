@@ -23,7 +23,10 @@ for tool in "$apksigner" "$aapt"; do
   [[ -x "$tool" ]] || { echo "::error::$tool is missing from the Android SDK"; exit 1; }
 done
 
-mapfile -t apks < <(find build/app/outputs/flutter-apk -maxdepth 1 -name '*-release.apk' | sort)
+apks=()
+while IFS= read -r apk; do
+  apks+=("$apk")
+done < <(find build/app/outputs/flutter-apk -maxdepth 1 -name '*-release.apk' | sort)
 if (( ${#apks[@]} == 0 )); then
   echo '::error::the build produced no release APK'
   exit 1
@@ -40,26 +43,49 @@ for apk in "${apks[@]}"; do
 
   if ! certs=$("$apksigner" verify --print-certs "$apk" 2>&1); then
     echo "::error::$base is not signed with a valid APK signature"
-    echo "$certs"
+    printf '%s\n' "$certs"
     exit 1
   fi
-  dn=$(sed -n 's/^Signer #1 certificate DN: //p' <<<"$certs" | head -1)
-  fingerprint=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' <<<"$certs" | head -1)
-  if [[ -z "$dn" || -z "$fingerprint" ]]; then
+
+  if [[ -z "${report_printed:-}" ]]; then
+    report_printed=1
+    echo "::group::apksigner report for $base"
+    printf '%s\n' "$certs" | head -12
+    echo "::endgroup::"
+  fi
+
+  # apksigner has reworded its report across build-tools releases, so match the
+  # labels instead of the whole line and fall back to the JAR signature block.
+  dn=$(sed -n 's/.*certificate DN:[[:space:]]*//p' <<<"$certs" | head -1)
+  fingerprint=$(sed -n 's/.*certificate SHA-256 digest:[[:space:]]*//p' <<<"$certs" | head -1 | tr -d ':')
+  if [[ -z "$fingerprint" ]]; then
+    if jarfile_cert=$(keytool -printcert -jarfile "$apk" 2>/dev/null); then
+      dn=${dn:-$(sed -n 's/^Owner:[[:space:]]*//p' <<<"$jarfile_cert" | head -1)}
+      fingerprint=$(sed -n 's/^[[:space:]]*SHA256:[[:space:]]*//p' <<<"$jarfile_cert" | head -1 | tr -d ':')
+    fi
+  fi
+  if [[ -z "$fingerprint" ]]; then
     echo "::error::$base did not report its signing certificate"
+    "$apksigner" version 2>&1 | head -2
+    printf '%s\n' "$certs"
     exit 1
   fi
+
   if [[ "$dn" == *"Android Debug"* ]]; then
     echo "::error::$base is signed with the Android debug certificate"
     exit 1
   fi
   if [[ -n "${ANDROID_CERT_SHA256:-}" ]]; then
     expected=$(tr -d ':' <<<"$ANDROID_CERT_SHA256" | tr '[:upper:]' '[:lower:]')
-    actual=$(tr -d ':' <<<"$fingerprint" | tr '[:upper:]' '[:lower:]')
+    actual=$(tr '[:upper:]' '[:lower:]' <<<"$fingerprint")
     if [[ "$actual" != "$expected" ]]; then
       echo "::error::$base is signed by $fingerprint, expected $expected"
       exit 1
     fi
+  elif [[ -z "$dn" ]]; then
+    echo "::error::$base reported no signer, and ANDROID_CERT_SHA256 is not set to pin one"
+    printf '%s\n' "$certs"
+    exit 1
   fi
 
   badging=$("$aapt" dump badging "$apk" | head -1)
