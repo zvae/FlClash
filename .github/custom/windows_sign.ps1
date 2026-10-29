@@ -263,7 +263,6 @@ try {
 
     New-Item -ItemType Directory -Force -Path $distDir | Out-Null
     Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
     [System.IO.Compression.ZipFile]::CreateFromDirectory(
         $bundleDir, $zipPath, [System.IO.Compression.CompressionLevel]::Optimal, $false)
     Write-Phase "archived the signed bundle"
