@@ -5,6 +5,8 @@
   "windowsProductName": "FlFly",
   "windowsCompanyName": "com.flfly",
   "windowsPublisherUrl": "https://github.com/zvae/FlClash",
+  "repository": "zvae/FlClash",
+  "telegramUrl": "",
   "replaceIcon": false,
   "signingMode": "self-signed"
 }

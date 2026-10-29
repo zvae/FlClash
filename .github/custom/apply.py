@@ -26,6 +26,8 @@ DEFAULTS: dict[str, object] = {
     'windowsProductName': 'FlClash',
     'windowsCompanyName': 'com.follow',
     'windowsPublisherUrl': 'https://github.com/chen08209/FlClash',
+    'repository': 'chen08209/FlClash',
+    'telegramUrl': 'https://t.me/FlClash',
     'replaceIcon': False,
     'signingMode': 'self-signed',
 }
@@ -34,6 +36,16 @@ SIGNING_MODES = ('self-signed', 'official')
 
 ANDROID_ID_RE = re.compile(r'^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$')
 WINDOWS_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
+REPOSITORY_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_.-]+$')
+
+TELEGRAM_ITEM = re.compile(
+    r"\n[ \t]*_buildLinkItem\(\n"
+    r"[ \t]*glyph: AppGlyphs\.send,\n"
+    r"[ \t]*title: 'Telegram',\n"
+    r"[ \t]*url: '[^']*',\n"
+    r"[ \t]*label: '[^']*',\n"
+    r"[ \t]*\),"
+)
 
 ANDROID_LAUNCHER_SIZES = {
     'mdpi': 48,
@@ -63,8 +75,21 @@ def load_config(root: Path) -> dict[str, object]:
             if not isinstance(value, bool):
                 raise SystemExit(f'branding: {key} must be true or false')
             continue
+        if key == 'telegramUrl':
+            # An empty value drops the Telegram row from the about page.
+            if not isinstance(value, str):
+                raise SystemExit(f'branding: {key} must be a string')
+            if value and not value.startswith(('http://', 'https://')):
+                raise SystemExit(f'branding: {key} must be an http(s) URL or empty: {value}')
+            continue
         if not isinstance(value, str) or not value.strip():
             raise SystemExit(f'branding: {key} must be a non-empty string')
+
+    if not REPOSITORY_RE.match(config['repository']):  # type: ignore[arg-type]
+        raise SystemExit(
+            'branding: repository must look like owner/name, it drives the update check: '
+            f'{config["repository"]}'
+        )
 
     if config['signingMode'] not in SIGNING_MODES:
         raise SystemExit(f'branding: signingMode must be one of {", ".join(SIGNING_MODES)}')
@@ -164,6 +189,34 @@ def apply_windows(root: Path, config: dict[str, object], changed: list[str]) -> 
         changed,
         root,
     )
+
+
+def apply_links(root: Path, config: dict[str, object], changed: list[str]) -> None:
+    """Points the in-app links at this repository instead of upstream."""
+    repository_value = str(config['repository'])
+    substitute(
+        root / 'lib/common/constant.dart',
+        r"^const repository = '[^']*';$",
+        f"const repository = '{repository_value}';",
+        changed,
+        root,
+    )
+
+    about = root / 'lib/views/about.dart'
+    telegram = str(config['telegramUrl']).strip()
+    if telegram:
+        label = telegram.split('://', 1)[-1].rstrip('/')
+        substitute(about, r"url: 'https://t\.me/[^']*'", f"url: '{telegram}'", changed, root)
+        substitute(about, r"label: 't\.me/[^']*'", f"label: '{label}'", changed, root)
+        return
+
+    text = about.read_text(encoding='utf-8')
+    updated, count = TELEGRAM_ITEM.subn('', text, count=1)
+    if count == 0:
+        print('branding: no Telegram link to drop from the about page', file=sys.stderr)
+        return
+    about.write_text(updated, encoding='utf-8')
+    changed.append(str(about.relative_to(root)))
 
 
 def _load_icon(root: Path, platform_icons: list[tuple[Path, object]]) -> None:
@@ -291,6 +344,7 @@ def main(argv: list[str]) -> int:
         apply_macos(root, config, changed)
     if args.platform in ('windows', 'all'):
         apply_windows(root, config, changed)
+    apply_links(root, config, changed)
 
     icon_replaced = False
     if config['replaceIcon']:
@@ -308,6 +362,8 @@ def main(argv: list[str]) -> int:
         'windowsProductName': config['windowsProductName'],
         'windowsCompanyName': config['windowsCompanyName'],
         'windowsPublisherUrl': config['windowsPublisherUrl'],
+        'repository': config['repository'],
+        'telegramUrl': config['telegramUrl'],
         'replaceIcon': config['replaceIcon'],
         'iconReplaced': icon_replaced,
         'signingMode': config['signingMode'],

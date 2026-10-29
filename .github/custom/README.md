@@ -50,8 +50,15 @@ the release commit.
 | `windowsProductName` | executable name, product strings, window title |
 | `windowsCompanyName` | `CompanyName` in the Windows version resource, installer publisher |
 | `windowsPublisherUrl` | support and updates URLs in the installer |
+| `repository` | `owner/name` the in-app update check and the about page point at |
+| `telegramUrl` | Telegram link on the about page; empty drops that row |
 | `replaceIcon` | when true, `icons/app-icon.png` replaces the Android, macOS and Windows icons |
 | `signingMode` | `self-signed` (default) or `official` |
+
+`repository` is what keeps the update check inside this project. The app reads `const repository` in
+`lib/common/constant.dart`, asks `api.github.com/repos/<repository>/releases/latest`, compares that tag with its own
+version, and opens `github.com/<repository>/releases/latest` for the download. Left at the upstream value, a branded
+build would offer the upstream download.
 
 Icons are opt-in. `replaceIcon: false`, a missing image, an image under 512 px, a non-square image, or a missing Pillow
 install all keep the upstream icons and let the build continue. Renaming the app never regenerates icons.
