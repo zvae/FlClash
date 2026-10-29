@@ -3,7 +3,8 @@
 
 set -euo pipefail
 
-for name in APP_NAME VERSION TAG APPLICATION_ID SOURCE_COMMIT UPSTREAM_COMMIT DIST_DIR; do
+for name in APP_NAME VERSION TAG APPLICATION_ID SOURCE_COMMIT UPSTREAM_COMMIT DIST_DIR \
+  KEY_ALIAS STORE_PASSWORD KEY_PASSWORD; do
   if [[ -z "${!name:-}" ]]; then
     echo "::error::android_verify.sh: $name is not set"
     exit 1
@@ -19,9 +20,26 @@ fi
 build_tools=$(find "$sdk/build-tools" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -1)
 apksigner="$build_tools/apksigner"
 aapt="$build_tools/aapt"
-for tool in "$apksigner" "$aapt"; do
+zipalign="$build_tools/zipalign"
+keystore="${KEYSTORE_PATH:-android/app/keystore.jks}"
+for tool in "$apksigner" "$aapt" "$zipalign"; do
   [[ -x "$tool" ]] || { echo "::error::$tool is missing from the Android SDK"; exit 1; }
 done
+[[ -f "$keystore" ]] || { echo "::error::$keystore is missing, the build cannot be re-signed"; exit 1; }
+
+# AGP leaves the v1 (JAR) signature out once minSdk reaches 24, and Honor and
+# Huawei installers read the certificate from that signature: a v2-only APK is
+# rejected with "this package contains no certificate". Sign all three schemes.
+resign_apk() {
+  local apk="$1" aligned="$1.aligned" signed="$1.signed"
+  "$zipalign" -f -p 4 "$apk" "$aligned"
+  "$apksigner" sign --ks "$keystore" --ks-key-alias "$KEY_ALIAS" \
+    --ks-pass env:STORE_PASSWORD --key-pass env:KEY_PASSWORD \
+    --min-sdk-version 21 --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true \
+    --out "$signed" "$aligned"
+  mv "$signed" "$apk"
+  rm -f "$aligned"
+}
 
 apks=()
 while IFS= read -r apk; do
@@ -41,7 +59,9 @@ for apk in "${apks[@]}"; do
   abi=$(sed -E 's/^app-(.*)-release\.apk$/\1/' <<<"$base")
   [[ "$abi" != "$base" ]] || abi='universal'
 
-  if ! certs=$("$apksigner" verify --print-certs "$apk" 2>&1); then
+  resign_apk "$apk"
+
+  if ! certs=$("$apksigner" verify --print-certs --verbose --min-sdk-version 21 "$apk" 2>&1); then
     echo "::error::$base is not signed with a valid APK signature"
     printf '%s\n' "$certs"
     exit 1
@@ -52,6 +72,11 @@ for apk in "${apks[@]}"; do
     echo "::group::apksigner report for $base"
     printf '%s\n' "$certs" | head -12
     echo "::endgroup::"
+  fi
+
+  if grep -q 'Verified using v1 scheme (JAR signing): false' <<<"$certs"; then
+    echo "::error::$base has no v1 (JAR) signature; Honor and Huawei installers reject that as 'no certificate'"
+    exit 1
   fi
 
   # apksigner has reworded its report across build-tools releases, so match the

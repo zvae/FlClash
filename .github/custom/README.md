@@ -81,7 +81,7 @@ What the pipeline does with that material:
 
 | Platform | Behaviour |
 | --- | --- |
-| Android | `apksigner verify` must pass, the debug certificate is refused, and `ANDROID_CERT_SHA256` pins the expected fingerprint |
+| Android | `apksigner verify` must pass, the debug certificate is refused, and `ANDROID_CERT_SHA256` pins the expected fingerprint. Each APK is re-signed with v1, v2 and v3: AGP drops the v1 (JAR) signature once `minSdk` reaches 24, and Honor and Huawei installers read the certificate from it, refusing a v2-only APK with "this package contains no certificate" |
 | Windows | Every executable and library in the bundle is signed, then the ZIP, then the installer. Signing and timestamping are separate `signtool` calls, so a timestamp server can never block a signature; the endpoint is chosen by probing before anything is signed, every `signtool` call has a timeout, the chain is anchored on the release certificate instead of a certificate store (importing a root store entry makes Windows try to update its root list over the network), and signer, timestamp, validity and chain are re-checked per file |
 | macOS | Every Mach-O is signed, the certificate is trusted for code signing on the runner only, Hardened Runtime plus `release.entitlements` are applied, the DMG is signed separately and verified |
 

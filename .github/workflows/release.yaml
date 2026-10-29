@@ -307,6 +307,10 @@ jobs:
           APPLICATION_ID: ${{ needs.prepare.outputs.application_id }}
           DIST_DIR: dist
           ANDROID_CERT_SHA256: ${{ secrets.ANDROID_CERT_SHA256 }}
+          KEYSTORE_PATH: android/app/keystore.jks
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: bash .github/custom/android_verify.sh
 
       - name: Upload

@@ -118,6 +118,20 @@ def substitute(path: Path, pattern: str, replacement: str, changed: list[str], r
         changed.append(str(path.relative_to(root)))
 
 
+def insert_after(path: Path, pattern: str, lines: list[str], changed: list[str], root: Path) -> None:
+    """Adds lines after the first match, keeping its indentation and staying idempotent."""
+    text = path.read_text(encoding='utf-8')
+    if all(f'{line}' in text for line in lines):
+        return
+    match = re.search(pattern, text, flags=re.MULTILINE)
+    if match is None:
+        raise SystemExit(f'branding: {pattern!r} not found in {path}')
+    indent = match.group(1) if match.groups() else '    '
+    insertion = ''.join(f'\n{indent}{line}' for line in lines)
+    path.write_text(text[: match.end()] + insertion + text[match.end() :], encoding='utf-8')
+    changed.append(str(path.relative_to(root)))
+
+
 def apply_android(root: Path, config: dict[str, object], changed: list[str]) -> None:
     app_name = str(config['appName'])
     application_id = str(config['androidApplicationId'])
@@ -133,6 +147,15 @@ def apply_android(root: Path, config: dict[str, object], changed: list[str]) -> 
         root / 'android/common/src/main/res/values/strings.xml',
         r'<string name="app_name">[^<]*</string>',
         f'<string name="app_name">{app_name}</string>',
+        changed,
+        root,
+    )
+    # Honor and Huawei installers read the certificate from the JAR signature and
+    # report "no certificate" for a v2-only APK, which is what upstream ships.
+    insert_after(
+        root / 'android/app/build.gradle.kts',
+        r'^([ \t]*)keyPassword = releaseKeyPassword$',
+        ['enableV1Signing = true', 'enableV2Signing = true'],
         changed,
         root,
     )
