@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  Entitlements for the Developer ID release build. Hardened Runtime rejects
+  anything not listed here, so this file is applied by the release workflow
+  instead of the Xcode target, which keeps local development builds unchanged.
+-->
+<dict>
+	<!-- TUN device, DNS override and the local proxy listener. -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+	<key>com.apple.security.network.server</key>
+	<true/>
+	<!-- Subscription imports and log exports. -->
+	<key>com.apple.security.files.user-selected.read-write</key>
+	<true/>
+	<!-- WiFi name lookups for the network-aware rules. -->
+	<key>com.apple.security.personal-information.location</key>
+	<true/>
+	<!-- The Go core and the Rust library are built outside Xcode's signing
+	     graph; library validation would otherwise refuse to load them. -->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+</dict>
+</plist>
