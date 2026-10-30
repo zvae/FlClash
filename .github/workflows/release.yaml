@@ -2,8 +2,9 @@ name: release
 
 on:
   schedule:
-    # 02:00 UTC, which is 10:00 in Beijing.
-    - cron: '0 2 * * *'
+    # 02:17 UTC, which is 10:17 in Beijing. The minute offset keeps the run out of
+    # the top-of-the-hour window, where the scheduler delays or drops runs.
+    - cron: '17 2 * * *'
   workflow_dispatch:
     inputs:
       tag:
