@@ -2,7 +2,8 @@ name: release
 
 on:
   schedule:
-    - cron: '17 3 * * *'
+    # 02:00 UTC, which is 10:00 in Beijing.
+    - cron: '0 2 * * *'
   workflow_dispatch:
     inputs:
       tag:
@@ -271,6 +272,10 @@ jobs:
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v6
+        with:
+          # A release depends on a new upstream tree almost every time, so its entries
+          # are rarely read again and would evict the branch caches. Restore only.
+          cache-read-only: true
 
       - name: Restore release keystore
         env:
@@ -352,6 +357,7 @@ jobs:
             services/helper
             plugins/rust_api/rust
           cache-directories: .dart_tool/hooks_runner
+          save-if: false
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -436,6 +442,7 @@ jobs:
             services/helper
             plugins/rust_api/rust
           cache-directories: .dart_tool/hooks_runner
+          save-if: false
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2

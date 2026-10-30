@@ -372,16 +372,22 @@ previously left `plugins/tray` unanalyzed and untested.
 
 ### CI Caches
 
-A run restores only cache entries saved on its own branch or tag, or on the default branch (`main`), and the
-repository holds 10 GB before evicting the least recently used entries. Every release is a new tag that no later run
-reads from, so `BRANCH_CACHE` turns caching off in tag runs: one release used to write about 9 GB of such entries and
-evict everything `dev` had saved. Release builds therefore start cold; branch runs, chiefly `dev`, keep the caches.
+A run restores only cache entries saved on its own branch or tag, or on the default branch (`automation` here, `main`
+upstream), and the repository holds 10 GB before evicting the least recently used entries. Every release is a new tag
+that no later run reads from, so `BRANCH_CACHE` turns caching off in tag runs: one release used to write about 9 GB of
+such entries and evict everything `dev` had saved. Release builds therefore start cold; branch runs, chiefly `dev`,
+keep the caches.
+
+`release.yaml` runs on the default branch, where its dependency fingerprints change with every upstream version, so it
+restores caches without ever saving them: `save-if: false` on the Rust caches, `cache-read-only: true` on Gradle. Only
+`build.yaml` writes.
 
 - setup-go keys its entry on the `cache-dependency-path` files alone and saves only on a miss, so jobs listing the
   same files share one entry holding the build cache of whichever finished first. `desktop` and `android` each add
   the file that drives their Core build to get an entry of their own.
-- setup-gradle writes only on the default branch unless told otherwise, so `android` lets `dev` write as well. Its
-  entries are keyed by job, which is one more reason the release build gains nothing from caching.
+- setup-gradle writes only on the default branch unless told otherwise, so `android` lets `dev` write as well, while
+  `release` stays restore-only. Its entries are keyed by job, which is one more reason the release build gains
+  nothing from caching.
 
 ## Worktree Tooling
 
