@@ -49,11 +49,37 @@ jobs:
       should_release: ${{ steps.prepare.outputs.should_release }}
       dry_run: ${{ steps.prepare.outputs.dry_run }}
     steps:
+      - name: Check app credentials
+        env:
+          CLIENT_ID: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [[ -n "$CLIENT_ID" ]] || missing+=("variable RELEASE_APP_CLIENT_ID")
+          [[ -n "$PRIVATE_KEY" ]] || missing+=("secret RELEASE_APP_PRIVATE_KEY")
+          if (( ${#missing[@]} > 0 )); then
+            printf '::error::the release app is not configured: %s\n' "${missing[*]}"
+            echo 'The mirror push carries upstream commits that edit .github/workflows, which GITHUB_TOKEN may never write.'
+            echo 'See .github/custom/README.md, GitHub configuration, for the app and the permissions it needs.'
+            exit 1
+          fi
+
+      - name: Mint app token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-workflows: write
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # The mirror push needs the workflows permission GITHUB_TOKEN cannot hold.
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Install icon tooling
         run: python3 -m pip install --disable-pip-version-check --quiet pillow

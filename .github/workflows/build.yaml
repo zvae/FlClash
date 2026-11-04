@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - '**'
+      # An app pushes these branches, and app pushes do start workflows.
+      - '!release-mirror/**'
     tags:
       - 'v*'
   workflow_dispatch:

@@ -117,8 +117,21 @@ Settings, Secrets and variables, Actions. Values are the exact contents, not fil
 | `APPLE_API_KEY_ID` | with the API key | Key id |
 | `APPLE_API_ISSUER_ID` | with the API key | Issuer id |
 
-Also required: Settings, Actions, General, workflow permissions set to read and write, so the run can push the release
-commit, create the tag, and attach assets with `GITHUB_TOKEN`.
+Also required: Settings, Actions, General, workflow permissions set to read and write, so the run can create the tag and
+attach assets with `GITHUB_TOKEN`.
+
+The mirror push is the exception. It replays upstream commits, and a pushed commit that touches `.github/workflows`
+needs the `workflows` permission, which `GITHUB_TOKEN` can never hold: the workflow `permissions` block has no key for
+it. The `prepare` job mints a GitHub App token instead:
+
+1. Settings, Developer settings, GitHub Apps, New GitHub App, with no webhook and no user authorization.
+2. Repository permissions: `Contents` read and write, `Workflows` read and write, everything else none.
+3. Install the app on this repository.
+4. Store the Client ID in the repository variable `RELEASE_APP_CLIENT_ID` and the downloaded private key, the whole
+   `.pem` file, in the secret `RELEASE_APP_PRIVATE_KEY`.
+
+A permission added to an app that is already installed does not reach its installation until that installation is
+approved again; until then the token keeps the old set and the push is rejected the same way.
 
 The `credentials` job fails the run before any build when a required secret is missing, and names every missing entry.
 
