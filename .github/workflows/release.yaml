@@ -587,6 +587,7 @@ jobs:
 
       - name: Gate
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare.outputs.tag }}
           VERSION: ${{ needs.prepare.outputs.version }}
           APP_NAME: ${{ needs.prepare.outputs.app_name }}

@@ -10,11 +10,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import re
 import sys
+import urllib.request
 from pathlib import Path
 
 GENERATED = {'SHA256SUMS', 'release-manifest.json', 'release.md'}
 EXPECTED_PLATFORMS = {'android', 'windows', 'macos'}
+UPSTREAM_CHANGELOG_BEGIN = '<!-- flclash:changelog:begin -->'
+UPSTREAM_CHANGELOG_END = '<!-- flclash:changelog:end -->'
 
 
 def fail(message: str) -> None:
@@ -102,15 +107,45 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def human_size(size: int) -> str:
-    for unit in ('B', 'KiB', 'MiB', 'GiB'):
-        if size < 1024 or unit == 'GiB':
-            return f'{size:.0f} {unit}' if unit == 'B' else f'{size:.1f} {unit}'
-        size /= 1024
-    return f'{size:.1f} GiB'
+def fetch_upstream_notes(repository: str, tag: str) -> str:
+    """The upstream changelog for this tag, or an empty string when it cannot be read."""
+    headers = {'Accept': 'application/vnd.github+json', 'User-Agent': 'FlClash-release'}
+    token = os.environ.get('GH_TOKEN')
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
+
+    def get(url: str) -> str | None:
+        try:
+            request = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.read().decode('utf-8')
+        except (OSError, UnicodeError):
+            return None
+
+    release = get(f'https://api.github.com/repos/{repository}/releases/tags/{tag}')
+    if release:
+        try:
+            body = json.loads(release).get('body') or ''
+        except json.JSONDecodeError:
+            body = ''
+        block = re.search(
+            f'{re.escape(UPSTREAM_CHANGELOG_BEGIN)}(.*?){re.escape(UPSTREAM_CHANGELOG_END)}',
+            body,
+            re.S,
+        )
+        if block:
+            return block.group(1).strip()
+
+    changelog = get(f'https://raw.githubusercontent.com/{repository}/main/CHANGELOG.md')
+    if changelog:
+        section = re.search(rf'^## {re.escape(tag)}[^\n]*\n(.*?)(?=^## |\Z)', changelog, re.S | re.M)
+        if section:
+            text = re.sub(r'^\*\*(.+?)\*\*$', r'### \1', section.group(1), flags=re.M)
+            return re.sub(r'\n{3,}', '\n\n', text).strip()
+    return ''
 
 
-def render_notes(manifest: dict) -> str:
+def render_notes(manifest: dict, upstream_notes: str) -> str:
     lines = [
         f'<!-- upstream-commit: {manifest["upstreamCommit"]} -->',
         f'# {manifest["appName"]} {manifest["tag"]}',
@@ -119,35 +154,12 @@ def render_notes(manifest: dict) -> str:
         f' tag `{manifest["upstreamTag"]}`, commit `{manifest["upstreamCommit"][:12]}`,'
         f' branded and signed by this repository.',
         '',
-        '## Downloads',
-        '',
-        '| File | Size | SHA-256 |',
-        '| --- | --- | --- |',
     ]
-    for entry in manifest['files']:
-        lines.append(f'| `{entry["name"]}` | {human_size(entry["size"])} | `{entry["sha256"]}` |')
+    if upstream_notes:
+        lines += ["## What's Changed", '', upstream_notes, '']
 
-    lines += ['', '## Signing', '']
-    for platform, summary in manifest['signing'].items():
-        for statement in summary:
-            lines.append(f'- **{platform}**: {statement}')
-
-    if manifest['signingMode'] == 'self-signed':
-        lines += [
-            '',
-            '### Self-signed build',
-            '',
-            'These installers are signed with this repository\'s own certificate, not with a publicly trusted one.',
-            '',
-            '- Windows shows "Unknown publisher" and SmartScreen may block the first run. Check the signature and the '
-            'SHA-256 above before running it, or trust the certificate from this repository first.',
-            '- macOS shows "unidentified developer". Open the app with right-click, Open, or run '
-            '`xattr -dr com.apple.quarantine /Applications/<App>.app` after installing it.',
-            '- Nothing here is notarized by Apple, and no SmartScreen or Gatekeeper reputation is claimed.',
-        ]
-
+    signing_note = 'These builds are self-signed; ' if manifest['signingMode'] == 'self-signed' else ''
     lines += [
-        '',
         '## Provenance',
         '',
         f'- Upstream tag: `{manifest["upstreamTag"]}`',
@@ -156,7 +168,8 @@ def render_notes(manifest: dict) -> str:
         f'- Signing mode: `{manifest["signingMode"]}`',
         f'- Workflow run: {manifest["runUrl"]}',
         '',
-        '`SHA256SUMS` and `release-manifest.json` cover every file above.',
+        f'{signing_note}`SHA256SUMS` and `release-manifest.json` hold the checksum'
+        ' and signing details of every asset.',
         '',
     ]
     return '\n'.join(lines)
@@ -245,7 +258,10 @@ def main(argv: list[str]) -> int:
         'verifications': entries,
     }
     (dist / 'release-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
-    (dist / 'release.md').write_text(render_notes(manifest), encoding='utf-8')
+    upstream_notes = fetch_upstream_notes(args.upstream_repository, args.tag)
+    if not upstream_notes:
+        print('::warning::no upstream changelog found; the release notes omit the changes section')
+    (dist / 'release.md').write_text(render_notes(manifest, upstream_notes), encoding='utf-8')
 
     print(f'gate: {len(files)} artifact(s) across {", ".join(sorted(platforms))}')
     for entry in files:
