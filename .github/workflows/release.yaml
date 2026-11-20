@@ -25,9 +25,6 @@ permissions:
 
 env:
   UPSTREAM_REPOSITORY: chen08209/FlClash
-  FLUTTER_VERSION: '3.47.6'
-  GO_VERSION: '1.27.1'
-  NDK_VERSION: r28c
   TIMESTAMP_URL: http://timestamp.digicert.com
 
 jobs:
@@ -48,6 +45,9 @@ jobs:
       signing_mode: ${{ steps.prepare.outputs.signing_mode }}
       should_release: ${{ steps.prepare.outputs.should_release }}
       dry_run: ${{ steps.prepare.outputs.dry_run }}
+      flutter_version: ${{ steps.prepare.outputs.flutter_version }}
+      go_version: ${{ steps.prepare.outputs.go_version }}
+      ndk_version: ${{ steps.prepare.outputs.ndk_version }}
     steps:
       - name: Check app credentials
         env:
@@ -200,6 +200,24 @@ jobs:
             exit 1
           fi
           emit version "$version"
+
+          # The release ref carries upstream's own build.yaml; read toolchain pins
+          # from it so an upstream bump cannot strand the fork on an old SDK.
+          read_pinned() {
+            local key="$1" line
+            line=$(grep -E "^[[:space:]]+${key}:" .github/workflows/build.yaml | head -1)
+            [[ -n "$line" ]] || return 1
+            line=${line#*:}
+            printf '%s' "$line" | sed -E "s/^[[:space:]]+//; s/[[:space:]]+$//; s/^['\"]//; s/['\"]$//"
+          }
+          flutter_version=$(read_pinned FLUTTER_VERSION) || { echo '::error::FLUTTER_VERSION missing from the release ref build.yaml'; exit 1; }
+          go_version=$(read_pinned GO_VERSION) || { echo '::error::GO_VERSION missing from the release ref build.yaml'; exit 1; }
+          ndk_version=$(read_pinned NDK_VERSION) || { echo '::error::NDK_VERSION missing from the release ref build.yaml'; exit 1; }
+          echo "toolchain pins from upstream build.yaml: Flutter $flutter_version, Go $go_version, NDK $ndk_version"
+          emit flutter_version "$flutter_version"
+          emit go_version "$go_version"
+          emit ndk_version "$ndk_version"
+
           emit app_name "$(jq -r '.appName' "$brand")"
           emit application_id "$(jq -r '.androidApplicationId' "$brand")"
           emit windows_product_name "$(jq -r '.windowsProductName' "$brand")"
@@ -273,21 +291,21 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version: ${{ needs.prepare.outputs.go_version }}
           cache-dependency-path: core/go.sum
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
-          flutter-version: ${{ env.FLUTTER_VERSION }}
+          flutter-version: ${{ needs.prepare.outputs.flutter_version }}
           cache: true
 
       - name: Setup NDK
         uses: nttld/setup-ndk@v1
         id: ndk
         with:
-          ndk-version: ${{ env.NDK_VERSION }}
+          ndk-version: ${{ needs.prepare.outputs.ndk_version }}
           add-to-path: true
           link-to-sdk: true
 
@@ -373,7 +391,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version: ${{ needs.prepare.outputs.go_version }}
           cache-dependency-path: core/go.sum
 
       - name: Setup Rust cache
@@ -390,7 +408,7 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
-          flutter-version: ${{ env.FLUTTER_VERSION }}
+          flutter-version: ${{ needs.prepare.outputs.flutter_version }}
           cache: true
 
       - name: Install Inno Setup
@@ -458,7 +476,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version: ${{ needs.prepare.outputs.go_version }}
           cache-dependency-path: core/go.sum
 
       - name: Setup Rust cache
@@ -475,7 +493,7 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
-          flutter-version: ${{ env.FLUTTER_VERSION }}
+          flutter-version: ${{ needs.prepare.outputs.flutter_version }}
           cache: true
 
       - name: Setup Xcode
