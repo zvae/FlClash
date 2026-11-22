@@ -71,18 +71,18 @@ SelfUpdateAsset? selfUpdateAssetFor(Abi abi, {required bool windowsInstalled}) {
 }
 
 String updateAssetName(String tag, SelfUpdateAsset asset) {
-  return releaseAssetName(
-    line: appReleaseLine,
-    version: releaseVersionOfTag(tag),
-    os: asset.os,
-    arch: asset.arch,
-    form: asset.form,
-    extension: asset.extension,
-  );
+  final arch = switch ((asset.os, asset.arch)) {
+    (ReleaseOs.android, ReleaseArch.arm64) => 'arm64-v8a',
+    (ReleaseOs.android, ReleaseArch.armv7) => 'armeabi-v7a',
+    (ReleaseOs.android, ReleaseArch.amd64) => 'x86_64',
+    (_, final arch) => arch.name,
+  };
+  final version = releaseVersionOfTag(tag);
+  return '$appName-$version-${asset.os.name}-$arch.${asset.extension}';
 }
 
 String updateChecksumsName(String tag) {
-  return releaseChecksumsName(appReleaseLine, releaseVersionOfTag(tag));
+  return 'SHA256SUMS';
 }
 
 Uri releaseAssetUri(String tag, String name) {
