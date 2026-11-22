@@ -232,6 +232,34 @@ def apply_links(root: Path, config: dict[str, object], changed: list[str]) -> No
         root,
     )
 
+    # Upstream's release-line names differ from this pipeline's legacy artifact names.
+    if (root / 'lib/common/release_asset.dart').exists():
+        substitute(
+            root / 'lib/common/app_update.dart',
+            r'String updateAssetName\(String tag, SelfUpdateAsset asset\) \{[\s\S]*?\n\}',
+            '''String updateAssetName(String tag, SelfUpdateAsset asset) {
+  final arch = switch ((asset.os, asset.arch)) {
+    (ReleaseOs.android, ReleaseArch.arm64) => 'arm64-v8a',
+    (ReleaseOs.android, ReleaseArch.armv7) => 'armeabi-v7a',
+    (ReleaseOs.android, ReleaseArch.amd64) => 'x86_64',
+    (_, final arch) => arch.name,
+  };
+  final version = releaseVersionOfTag(tag);
+  return '$appName-$version-${asset.os.name}-$arch.${asset.extension}';
+}''',
+            changed,
+            root,
+        )
+        substitute(
+            root / 'lib/common/app_update.dart',
+            r'String updateChecksumsName\(String tag\) \{[\s\S]*?\n\}',
+            '''String updateChecksumsName(String tag) {
+  return 'SHA256SUMS';
+}''',
+            changed,
+            root,
+        )
+
     about = root / 'lib/views/about.dart'
     telegram = str(config['telegramUrl']).strip()
     if telegram:

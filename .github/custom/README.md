@@ -60,6 +60,11 @@ the release commit.
 version, and opens `github.com/<repository>/releases/latest` for the download. Left at the upstream value, a branded
 build would offer the upstream download.
 
+The branding script also aligns in-app update names with this pipeline: `FlFly-<version>-<platform>-<arch>.<ext>`
+(using the configured app name), Android's `arm64-v8a`, `armeabi-v7a` and `x86_64` ABI names, and bare `SHA256SUMS`.
+Upstream tags with the newer release-line naming API are patched at the update entry points as well; changing the
+display name alone does not change their independently generated asset names.
+
 Icons are opt-in. `replaceIcon: false`, a missing image, an image under 512 px, a non-square image, or a missing Pillow
 install all keep the upstream icons and let the build continue. Renaming the app never regenerates icons.
 
