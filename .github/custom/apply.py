@@ -216,6 +216,13 @@ def apply_windows(root: Path, config: dict[str, object], changed: list[str]) -> 
 
 def apply_links(root: Path, config: dict[str, object], changed: list[str]) -> None:
     """Points the in-app links at this repository instead of upstream."""
+    substitute(
+        root / 'lib/common/constant.dart',
+        r"^const appName = '[^']*';$",
+        f"const appName = '{config['appName']}';",
+        changed,
+        root,
+    )
     repository_value = str(config['repository'])
     substitute(
         root / 'lib/common/constant.dart',
