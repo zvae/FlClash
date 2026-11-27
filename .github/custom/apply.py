@@ -104,18 +104,37 @@ def load_config(root: Path) -> dict[str, object]:
     return config
 
 
-def substitute(path: Path, pattern: str, replacement: str, changed: list[str], root: Path) -> None:
+def substitute(
+    path: Path,
+    pattern: str,
+    replacement: str,
+    changed: list[str],
+    root: Path,
+    *,
+    required: bool = True,
+    quiet: bool = False,
+) -> bool:
+    """Replace the first match; optional adaptations may be absent upstream."""
     if not path.exists():
-        raise SystemExit(f'branding: expected {path} to exist')
+        if required:
+            raise SystemExit(f'branding: expected {path} to exist')
+        if not quiet:
+            print(f'branding: {path} is missing, skipping optional adaptation', file=sys.stderr)
+        return False
     text = path.read_text(encoding='utf-8')
     updated, count = re.subn(pattern, lambda _: replacement, text, count=1, flags=re.MULTILINE)
     if count == 0:
         if replacement in text:
-            return
-        raise SystemExit(f'branding: {pattern!r} not found in {path}')
+            return True
+        if required:
+            raise SystemExit(f'branding: {pattern!r} not found in {path}')
+        if not quiet:
+            print(f'branding: {pattern!r} not found in {path}, skipping optional adaptation', file=sys.stderr)
+        return False
     if updated != text:
         path.write_text(updated, encoding='utf-8')
         changed.append(str(path.relative_to(root)))
+    return True
 
 
 def insert_after(path: Path, pattern: str, lines: list[str], changed: list[str], root: Path) -> None:
@@ -214,6 +233,64 @@ def apply_windows(root: Path, config: dict[str, object], changed: list[str]) -> 
     )
 
 
+UPDATE_ASSET_BODY = '''String updateAssetName(String tag, SelfUpdateAsset asset) {
+  final arch = switch ((asset.os, asset.arch)) {
+    (ReleaseOs.android, ReleaseArch.arm64) => 'arm64-v8a',
+    (ReleaseOs.android, ReleaseArch.armv7) => 'armeabi-v7a',
+    (ReleaseOs.android, ReleaseArch.amd64) => 'x86_64',
+    (_, final arch) => arch.name,
+  };
+  final version = releaseVersionOfTag(tag);
+  return '$appName-$version-${asset.os.name}-$arch.${asset.extension}';
+}'''
+
+UPDATE_CHECKSUMS_BODY = '''String updateChecksumsName(String tag) {
+  return 'SHA256SUMS';
+}'''
+
+# Upstream has moved these helpers between app_update.dart (v0.9.4 and earlier)
+# and release_asset.dart (later), and changed releaseAssetName's signature. Patch
+# whichever definition is present at either site instead of matching one layout.
+UPDATE_HOOKS = (
+    (
+        r'String updateAssetName\(String tag, SelfUpdateAsset asset\) \{[\s\S]*?\n\}',
+        UPDATE_ASSET_BODY,
+        'updateAssetName',
+    ),
+    (
+        r'String updateChecksumsName\(String tag\) \{[\s\S]*?\n\}',
+        UPDATE_CHECKSUMS_BODY,
+        'updateChecksumsName',
+    ),
+)
+UPDATE_HOOK_FILES = ('lib/common/app_update.dart', 'lib/common/release_asset.dart')
+
+
+def adapt_release_names(root: Path, config: dict[str, object], changed: list[str]) -> None:
+    """Make the branded app look for this pipeline's artifact names.
+
+    Returns without changes on upstream trees that still use the inline
+    releaseAssetName(tag, suffix) helper: that helper already reads `appName`,
+    which apply_links rewrites, so the names follow the brand on their own.
+    """
+    if not (root / 'lib/common/release_asset.dart').exists():
+        return
+    substitute(
+        root / 'lib/common/release_asset.dart',
+        r'^const releaseFilePrefix = .*;$',
+        f"const releaseFilePrefix = '{config['appName']}';",
+        changed,
+        root,
+    )
+    for pattern, body, label in UPDATE_HOOKS:
+        adapted = [
+            substitute(root / path, pattern, body, changed, root, required=False, quiet=True)
+            for path in UPDATE_HOOK_FILES
+        ]
+        if not any(adapted):
+            print(f'branding: no {label} hook found to adapt; keeping upstream naming', file=sys.stderr)
+
+
 def apply_links(root: Path, config: dict[str, object], changed: list[str]) -> None:
     """Points the in-app links at this repository instead of upstream."""
     substitute(
@@ -232,33 +309,7 @@ def apply_links(root: Path, config: dict[str, object], changed: list[str]) -> No
         root,
     )
 
-    # Upstream's release-line names differ from this pipeline's legacy artifact names.
-    if (root / 'lib/common/release_asset.dart').exists():
-        substitute(
-            root / 'lib/common/app_update.dart',
-            r'String updateAssetName\(String tag, SelfUpdateAsset asset\) \{[\s\S]*?\n\}',
-            '''String updateAssetName(String tag, SelfUpdateAsset asset) {
-  final arch = switch ((asset.os, asset.arch)) {
-    (ReleaseOs.android, ReleaseArch.arm64) => 'arm64-v8a',
-    (ReleaseOs.android, ReleaseArch.armv7) => 'armeabi-v7a',
-    (ReleaseOs.android, ReleaseArch.amd64) => 'x86_64',
-    (_, final arch) => arch.name,
-  };
-  final version = releaseVersionOfTag(tag);
-  return '$appName-$version-${asset.os.name}-$arch.${asset.extension}';
-}''',
-            changed,
-            root,
-        )
-        substitute(
-            root / 'lib/common/app_update.dart',
-            r'String updateChecksumsName\(String tag\) \{[\s\S]*?\n\}',
-            '''String updateChecksumsName(String tag) {
-  return 'SHA256SUMS';
-}''',
-            changed,
-            root,
-        )
+    adapt_release_names(root, config, changed)
 
     about = root / 'lib/views/about.dart'
     telegram = str(config['telegramUrl']).strip()
@@ -380,6 +431,70 @@ def read_version(root: Path) -> tuple[str, str]:
     return full.split('+', 1)[0], full
 
 
+def verify_branding(root: Path, config: dict[str, object], platform: str) -> None:
+    """Fail before a release is cut when a required brand substitution did not land.
+
+    Hook adaptations use required=False so an upstream refactor cannot crash the
+    build outright; this check is what turns a missed adaptation into a clear,
+    early error instead of a silently mis-named release.
+    """
+    app_name = str(config['appName'])
+
+    def expect(path: Path, pattern: str, label: str) -> None:
+        if not path.exists():
+            raise SystemExit(f'branding verify: {path} is missing')
+        text = path.read_text(encoding='utf-8')
+        if not re.search(pattern, text, flags=re.MULTILINE):
+            raise SystemExit(f'branding verify: {label} not found in {path}')
+
+    constant = root / 'lib/common/constant.dart'
+    expect(constant, rf"^const appName = '{re.escape(app_name)}';$", f'appName={app_name}')
+    expect(
+        constant,
+        rf"^const repository = '{re.escape(str(config['repository']))}';$",
+        f"repository={config['repository']}",
+    )
+
+    # An upstream tree without release_asset.dart uses the inline helper that
+    # reads `appName` directly, so the two constants above are the whole story.
+    if (root / 'lib/common/release_asset.dart').exists():
+        expect(
+            root / 'lib/common/release_asset.dart',
+            rf"^const releaseFilePrefix = '{re.escape(app_name)}';$",
+            f'releaseFilePrefix={app_name}',
+        )
+        hooked = any(
+            (root / path).exists()
+            and UPDATE_ASSET_BODY in (root / path).read_text(encoding='utf-8')
+            and UPDATE_CHECKSUMS_BODY in (root / path).read_text(encoding='utf-8')
+            for path in UPDATE_HOOK_FILES
+        )
+        if not hooked:
+            raise SystemExit(
+                'branding verify: no branded update-name hooks found in app_update.dart or '
+                'release_asset.dart; upstream changed its release naming API'
+            )
+
+    if platform in ('android', 'all'):
+        expect(
+            root / 'android/app/build.gradle.kts',
+            rf'applicationId = "{re.escape(str(config["androidApplicationId"]))}"',
+            'android applicationId',
+        )
+    if platform in ('macos', 'all'):
+        expect(
+            root / 'macos/Runner/Configs/AppInfo.xcconfig',
+            rf'^PRODUCT_BUNDLE_IDENTIFIER = {re.escape(str(config["macosBundleId"]))}$',
+            'macOS bundle id',
+        )
+    if platform in ('windows', 'all'):
+        expect(
+            root / 'windows/CMakeLists.txt',
+            rf'^set\(BINARY_NAME "{re.escape(str(config["windowsProductName"]))}"\)$',
+            'Windows binary name',
+        )
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', default='.', help='checkout to brand')
@@ -403,6 +518,7 @@ def main(argv: list[str]) -> int:
     if args.platform in ('windows', 'all'):
         apply_windows(root, config, changed)
     apply_links(root, config, changed)
+    verify_branding(root, config, args.platform)
 
     icon_replaced = False
     if config['replaceIcon']:
