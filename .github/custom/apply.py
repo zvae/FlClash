@@ -15,6 +15,9 @@ import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import release_names  # noqa: E402 - sibling module, path set above
+
 CONFIG_PATH = Path('.github/custom/brand.json')
 ICON_PATH = Path('.github/custom/icons/app-icon.png')
 STATE_PATH = Path('.github/custom/.branding/state.json')
@@ -233,20 +236,8 @@ def apply_windows(root: Path, config: dict[str, object], changed: list[str]) -> 
     )
 
 
-UPDATE_ASSET_BODY = '''String updateAssetName(String tag, SelfUpdateAsset asset) {
-  final arch = switch ((asset.os, asset.arch)) {
-    (ReleaseOs.android, ReleaseArch.arm64) => 'arm64-v8a',
-    (ReleaseOs.android, ReleaseArch.armv7) => 'armeabi-v7a',
-    (ReleaseOs.android, ReleaseArch.amd64) => 'x86_64',
-    (_, final arch) => arch.name,
-  };
-  final version = releaseVersionOfTag(tag);
-  return '$appName-$version-${asset.os.name}-$arch.${asset.extension}';
-}'''
-
-UPDATE_CHECKSUMS_BODY = '''String updateChecksumsName(String tag) {
-  return 'SHA256SUMS';
-}'''
+UPDATE_ASSET_BODY = release_names.update_asset_hook()
+UPDATE_CHECKSUMS_BODY = release_names.UPDATE_CHECKSUMS_HOOK
 
 # Upstream has moved these helpers between app_update.dart (v0.9.4 and earlier)
 # and release_asset.dart (later), and changed releaseAssetName's signature. Patch

@@ -13,6 +13,7 @@ Everything the release pipeline needs lives in this directory, so none of it mix
 | `windows_sign.ps1` | Authenticode signing, packaging, and signature verification |
 | `macos_sign.sh` | code signing, DMG packaging, notarization when available, verification |
 | `manifest.py` | release gate: manifest, checksums and release notes |
+| `release_names.py` | single source of truth for artifact names, shared by `apply.py` and `manifest.py` |
 | `make-signing-material.sh` | one-time generator for the Android keystore and the Windows and macOS certificates |
 
 `.github/workflows/release.yaml` runs the pipeline: daily at 03:17 UTC, or by hand with an optional upstream tag and a
@@ -67,6 +68,10 @@ display name alone does not change their independently generated asset names. Th
 signature across upstream versions, so the patch is tried at both entry points and treated as optional: a missing hook
 cannot fail the build on its own. Instead, `apply.py` verifies every required brand substitution on disk before it
 succeeds, and a tree whose naming API is no longer recognised is rejected with an explicit error at prepare time.
+
+`release_names.py` is the single source of truth for artifact names. `apply.py` generates the client ABI map from it,
+and `manifest.py` requires the published set to match it exactly. An ABI or platform rename therefore has to be made
+in one place, and a mismatch between what the app downloads and what the release publishes fails the gate.
 
 Icons are opt-in. `replaceIcon: false`, a missing image, an image under 512 px, a non-square image, or a missing Pillow
 install all keep the upstream icons and let the build continue. Renaming the app never regenerates icons.

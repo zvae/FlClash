@@ -16,6 +16,9 @@ import sys
 import urllib.request
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import release_names  # noqa: E402 - sibling module, path set above
+
 GENERATED = {'SHA256SUMS', 'release-manifest.json', 'release.md'}
 EXPECTED_PLATFORMS = {'android', 'windows', 'macos'}
 UPSTREAM_CHANGELOG_BEGIN = '<!-- flclash:changelog:begin -->'
@@ -79,6 +82,7 @@ def collect_artifacts(dist: Path, entries: list[dict], app: str, version: str) -
                 fail(f'{name} is claimed by both {claimed[name]} and verification-{entry.get("platform")}')
             claimed[name] = f'verification-{entry.get("platform")}'
 
+    expected = release_names.expected_assets(app, version)
     artifacts = []
     for path in sorted(dist.iterdir()):
         if not path.is_file():
@@ -87,15 +91,20 @@ def collect_artifacts(dist: Path, entries: list[dict], app: str, version: str) -
             continue
         if path.name not in claimed:
             fail(f'{path.name} is not covered by any platform verification')
-        if not path.name.startswith(f'{app}-{version}-'):
-            fail(f'{path.name} does not follow {app}-{version}-<platform>-<arch>.<ext>')
+        if path.name not in expected:
+            fail(
+                f'{path.name} is not a release asset; expected one of: '
+                f'{", ".join(sorted(expected))}'
+            )
         artifacts.append(path)
 
-    missing = sorted(set(claimed) - {path.name for path in artifacts})
+    present = {path.name for path in artifacts}
+    missing = sorted(expected - present)
     if missing:
-        fail(f'verification lists files that are not in dist: {", ".join(missing)}')
-    if not artifacts:
-        fail('dist holds no artifact to publish')
+        fail(f'expected release assets are missing from dist: {", ".join(missing)}')
+    unlisted = sorted(set(claimed) - present)
+    if unlisted:
+        fail(f'verification lists files that are not in dist: {", ".join(unlisted)}')
     return artifacts
 
 
