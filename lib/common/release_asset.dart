@@ -2,7 +2,7 @@
 import 'dart:convert';
 import 'dart:ffi' show Abi;
 
-const releaseFilePrefix = 'FlClash';
+const releaseFilePrefix = 'FlFly';
 
 enum ReleaseLine { dev, rs }
 
@@ -109,13 +109,14 @@ SelfUpdateAsset? selfUpdateAssetFor(Abi abi, {required bool replaceable}) {
 }
 
 String updateAssetName(String tag, SelfUpdateAsset asset) {
-  return releaseAssetName(
-    version: releaseVersionOfTag(tag),
-    os: asset.os,
-    arch: asset.arch,
-    form: asset.form,
-    extension: asset.extension,
-  );
+  final arch = switch ((asset.os, asset.arch)) {
+    (ReleaseOs.android, ReleaseArch.arm64) => 'arm64-v8a',
+    (ReleaseOs.android, ReleaseArch.armv7) => 'armeabi-v7a',
+    (ReleaseOs.android, ReleaseArch.amd64) => 'x86_64',
+    (_, final other) => other.name,
+  };
+  final version = releaseVersionOfTag(tag);
+  return '$appName-$version-${asset.os.name}-$arch.${asset.extension}';
 }
 
 /// False for a tag such as `nightly`, `v1.2.0-beta-1` or a stable rebuild
@@ -124,7 +125,7 @@ bool namesReleaseFiles(String tag) =>
     _version.hasMatch(releaseVersionOfTag(tag));
 
 String updateChecksumsName(String tag) {
-  return releaseChecksumsName(releaseVersionOfTag(tag));
+  return 'SHA256SUMS';
 }
 
 final _checksumLine = RegExp(r'^([0-9a-fA-F]{64}) [ *](.+)$');

@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""Gates the collected release artifacts and writes the manifest, notes and sums.
+
+Runs after every platform job. A single unsigned, unnotarized, mismatched or
+unclaimed file fails the run before anything is published.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import release_names  # noqa: E402 - sibling module, path set above
+
+GENERATED = {'SHA256SUMS', 'release-manifest.json', 'release.md'}
+EXPECTED_PLATFORMS = {'android', 'windows', 'macos'}
+UPSTREAM_CHANGELOG_BEGIN = '<!-- flclash:changelog:begin -->'
+UPSTREAM_CHANGELOG_END = '<!-- flclash:changelog:end -->'
+
+
+def fail(message: str) -> None:
+    print(f'::error::{message}')
+    sys.exit(1)
+
+
+def load_verifications(dist: Path) -> list[dict]:
+    entries = []
+    for path in sorted(dist.glob('verification-*.json')):
+        try:
+            entries.append(json.loads(path.read_text(encoding='utf-8')))
+        except json.JSONDecodeError as error:
+            fail(f'{path.name} is not valid JSON: {error}')
+    if not entries:
+        fail('no verification-*.json was uploaded by the platform jobs')
+    return entries
+
+
+def check_verification(entry: dict, expected: dict, signing_mode: str) -> None:
+    name = f"verification-{entry.get('platform')}-{entry.get('arch', '')}"
+    for key, value in expected.items():
+        if entry.get(key) != value:
+            fail(f'{name}: {key} is {entry.get(key)!r}, expected {value!r}')
+    if entry.get('signed') is not True:
+        fail(f'{name}: the artifacts are not signed')
+    official = signing_mode == 'official'
+    platform = entry.get('platform')
+    if platform == 'macos':
+        if entry.get('signingMode') != signing_mode:
+            fail(f'{name}: signed in {entry.get("signingMode")!r} mode, this run expects {signing_mode!r}')
+        if official:
+            if entry.get('notarized') is not True:
+                fail(f'{name}: the disk image is not notarized')
+            if entry.get('stapled') is not True:
+                fail(f'{name}: the notarization ticket is not stapled')
+        elif entry.get('notarized') is not False:
+            fail(f'{name}: a self-signed disk image cannot claim notarization')
+    if platform == 'windows':
+        signing = entry.get('signing', {})
+        if signing.get('timestamped') is not True:
+            fail(f'{name}: the signatures carry no timestamp')
+        if signing.get('chainValidated') is not True:
+            fail(f'{name}: the signature chain was not validated')
+        if bool(signing.get('selfSigned')) != (not official):
+            fail(f'{name}: the signature is not labelled self-signed correctly')
+    if platform == 'android':
+        if not entry.get('signing', {}).get('certificateSha256'):
+            fail(f'{name}: the signing certificate was not recorded')
+
+
+def collect_artifacts(dist: Path, entries: list[dict], app: str, version: str) -> list[Path]:
+    claimed: dict[str, str] = {}
+    for entry in entries:
+        for name in entry.get('files', []):
+            if name in claimed:
+                fail(f'{name} is claimed by both {claimed[name]} and verification-{entry.get("platform")}')
+            claimed[name] = f'verification-{entry.get("platform")}'
+
+    expected = release_names.expected_assets(app, version)
+    artifacts = []
+    for path in sorted(dist.iterdir()):
+        if not path.is_file():
+            continue
+        if path.name in GENERATED or path.name.startswith('verification-'):
+            continue
+        if path.name not in claimed:
+            fail(f'{path.name} is not covered by any platform verification')
+        if path.name not in expected:
+            fail(
+                f'{path.name} is not a release asset; expected one of: '
+                f'{", ".join(sorted(expected))}'
+            )
+        artifacts.append(path)
+
+    present = {path.name for path in artifacts}
+    missing = sorted(expected - present)
+    if missing:
+        fail(f'expected release assets are missing from dist: {", ".join(missing)}')
+    unlisted = sorted(set(claimed) - present)
+    if unlisted:
+        fail(f'verification lists files that are not in dist: {", ".join(unlisted)}')
+    return artifacts
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def fetch_upstream_notes(repository: str, tag: str) -> str:
+    """The upstream changelog for this tag, or an empty string when it cannot be read."""
+    headers = {'Accept': 'application/vnd.github+json', 'User-Agent': 'FlClash-release'}
+    token = os.environ.get('GH_TOKEN')
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
+
+    def get(url: str) -> str | None:
+        try:
+            request = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.read().decode('utf-8')
+        except (OSError, UnicodeError):
+            return None
+
+    release = get(f'https://api.github.com/repos/{repository}/releases/tags/{tag}')
+    if release:
+        try:
+            body = json.loads(release).get('body') or ''
+        except json.JSONDecodeError:
+            body = ''
+        block = re.search(
+            f'{re.escape(UPSTREAM_CHANGELOG_BEGIN)}(.*?){re.escape(UPSTREAM_CHANGELOG_END)}',
+            body,
+            re.S,
+        )
+        if block:
+            return block.group(1).strip()
+
+    changelog = get(f'https://raw.githubusercontent.com/{repository}/main/CHANGELOG.md')
+    if changelog:
+        section = re.search(rf'^## {re.escape(tag)}[^\n]*\n(.*?)(?=^## |\Z)', changelog, re.S | re.M)
+        if section:
+            text = re.sub(r'^\*\*(.+?)\*\*$', r'### \1', section.group(1), flags=re.M)
+            return re.sub(r'\n{3,}', '\n\n', text).strip()
+    return ''
+
+
+def render_notes(manifest: dict, upstream_notes: str) -> str:
+    lines = [
+        f'<!-- upstream-commit: {manifest["upstreamCommit"]} -->',
+        f'# {manifest["appName"]} {manifest["tag"]}',
+        '',
+        f'Built from [{manifest["upstreamRepository"]}](https://github.com/{manifest["upstreamRepository"]})'
+        f' tag `{manifest["upstreamTag"]}`, commit `{manifest["upstreamCommit"][:12]}`,'
+        f' branded and signed by this repository.',
+        '',
+    ]
+    if upstream_notes:
+        lines += ["## What's Changed", '', upstream_notes, '']
+
+    signing_note = 'These builds are self-signed; ' if manifest['signingMode'] == 'self-signed' else ''
+    lines += [
+        '## Provenance',
+        '',
+        f'- Upstream tag: `{manifest["upstreamTag"]}`',
+        f'- Upstream commit: `{manifest["upstreamCommit"]}`',
+        f'- Source commit: `{manifest["sourceCommit"]}`',
+        f'- Signing mode: `{manifest["signingMode"]}`',
+        f'- Workflow run: {manifest["runUrl"]}',
+        '',
+        f'{signing_note}`SHA256SUMS` and `release-manifest.json` hold the checksum'
+        ' and signing details of every asset.',
+        '',
+    ]
+    return '\n'.join(lines)
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--dist', required=True)
+    parser.add_argument('--tag', required=True)
+    parser.add_argument('--version', required=True)
+    parser.add_argument('--app-name', required=True)
+    parser.add_argument('--upstream-repository', required=True)
+    parser.add_argument('--upstream-commit', required=True)
+    parser.add_argument('--source-commit', required=True)
+    parser.add_argument('--run-url', required=True)
+    parser.add_argument('--signing-mode', default='self-signed', choices=['self-signed', 'official'])
+    args = parser.parse_args(argv)
+
+    dist = Path(args.dist)
+    if not dist.is_dir():
+        fail(f'{dist} does not exist')
+
+    entries = load_verifications(dist)
+    expected = {
+        'tag': args.tag,
+        'version': args.version,
+        'sourceCommit': args.source_commit,
+        'upstreamCommit': args.upstream_commit,
+    }
+    for entry in entries:
+        check_verification(entry, expected, args.signing_mode)
+
+    platforms = {entry.get('platform') for entry in entries}
+    missing_platforms = EXPECTED_PLATFORMS - platforms
+    if missing_platforms:
+        fail(f'no verification for: {", ".join(sorted(missing_platforms))}')
+
+    artifacts = collect_artifacts(dist, entries, args.app_name, args.version)
+
+    files = []
+    sums = []
+    for path in artifacts:
+        digest = sha256(path)
+        files.append({'name': path.name, 'size': path.stat().st_size, 'sha256': digest})
+        sums.append(f'{digest}  {path.name}')
+    (dist / 'SHA256SUMS').write_text('\n'.join(sums) + '\n', encoding='utf-8')
+
+    signing: dict[str, list[str]] = {}
+    for entry in entries:
+        platform = entry['platform']
+        statements = signing.setdefault(platform, [])
+        if platform == 'android':
+            statements.append(
+                f'APK signature verified with the release keystore (certificate SHA-256 '
+                f'`{entry["signing"]["certificateSha256"]}`)'
+            )
+        elif platform == 'windows':
+            statements.append(
+                f'Authenticode signature on every executable and on the installer, subject '
+                f'`{entry["signing"].get("subject")}`, timestamped, chain validated'
+            )
+        elif platform == 'macos':
+            if args.signing_mode == 'official':
+                statements.append(
+                    f'{entry.get("arch")} disk image signed with `{entry["signing"].get("identity")}`, '
+                    f'Hardened Runtime on, notarized ({entry["notarization"].get("status")}) and stapled'
+                )
+            else:
+                statements.append(
+                    f'{entry.get("arch")} disk image signed with `{entry["signing"].get("identity")}`, '
+                    f'Hardened Runtime on, not notarized (self-signed)'
+                )
+
+    manifest = {
+        'appName': args.app_name,
+        'tag': args.tag,
+        'version': args.version,
+        'upstreamRepository': args.upstream_repository,
+        'upstreamTag': args.tag,
+        'upstreamCommit': args.upstream_commit,
+        'sourceCommit': args.source_commit,
+        'runUrl': args.run_url,
+        'signingMode': args.signing_mode,
+        'files': files,
+        'signing': signing,
+        'verifications': entries,
+    }
+    (dist / 'release-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
+    upstream_notes = fetch_upstream_notes(args.upstream_repository, args.tag)
+    if not upstream_notes:
+        print('::warning::no upstream changelog found; the release notes omit the changes section')
+    (dist / 'release.md').write_text(render_notes(manifest, upstream_notes), encoding='utf-8')
+
+    print(f'gate: {len(files)} artifact(s) across {", ".join(sorted(platforms))}')
+    for entry in files:
+        print(f'  {entry["name"]}  {entry["sha256"]}')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
